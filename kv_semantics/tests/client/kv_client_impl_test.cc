@@ -17,6 +17,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include "kv_metrics/metrics.h"
@@ -70,6 +71,7 @@ struct TestState {
     std::unordered_map<NodeId, Status> deleteFailures;
     std::unordered_map<NodeId, std::vector<Status>> checkEntryStatus;
     std::unordered_map<NodeId, Status> checkResultStatus;
+    std::unordered_set<NodeId> unhealthyNodes;
     std::vector<NodeId> registerCalls;
     std::vector<NodeId> providerBindCalls;
     std::vector<KVBuffer> submittedEntries;
@@ -214,7 +216,13 @@ public:
         return Status::OK();
     }
 
-    Status CheckHealth() override { return initialized_ ? Status::OK() : NotInitialized(); }
+    Status CheckHealth() override
+    {
+        if (state_->unhealthyNodes.count(config_.nodeId) != 0) {
+            return Status::Error(StatusCode::CONNECTION_ERROR, "fake transport is unhealthy");
+        }
+        return initialized_ ? Status::OK() : NotInitialized();
+    }
 
     virtual Status RunQuery(BatchView<CacheKey> keys, QueryResult& result)
     {
@@ -543,6 +551,29 @@ CacheKey FindKeyForAsu(const std::vector<NodeId>& asuIds, NodeId targetAsuId)
         if (routes.size() == 1 && routes.begin()->first == targetAsuId) { return cacheKey; }
     }
     return {};
+}
+
+// Returns keys whose primary owner is unavailableNode and whose failover result either has
+// no owner (expectNoOwner) or has another owner. Uses the same router contract as the
+// client, so the expectation is deterministic for the produced keys.
+std::vector<CacheKey> FindKeysByFailover(const std::vector<NodeId>& asuIds, NodeId unavailableNode,
+                                         bool expectNoOwner, std::size_t count)
+{
+    std::vector<kv::NodeId> nodeIds(asuIds.begin(), asuIds.end());
+    auto router = kv::CreateRouter(nodeIds, kv::HashFunction{}, kv::RouterConfig{});
+    std::vector<CacheKey> keys;
+    keys.reserve(count);
+    for (std::uint32_t index = 1; keys.size() < count && index < 1000000; ++index) {
+        std::uint64_t combined = (static_cast<std::uint64_t>(unavailableNode) << 32) | index;
+        CacheKey cacheKey{};
+        std::memcpy(cacheKey.data(), &combined, sizeof(combined));
+        auto routeKey = std::string(CacheKeyView(cacheKey));
+        auto primary = router->RouteKeys({routeKey});
+        if (primary.size() != 1 || primary.begin()->first != unavailableNode) { continue; }
+        const auto failover = router->RouteKeys({routeKey}, kv::UnavailableNodeSet{unavailableNode});
+        if (failover.empty() == expectNoOwner) { keys.push_back(cacheKey); }
+    }
+    return keys;
 }
 
 std::vector<KVBuffer> BuildRoutedEntries(const std::vector<NodeId>& routeOrder)
@@ -2320,6 +2351,74 @@ TEST(KvClientImplTest,
     TaskResult secondTaskResult;
     EXPECT_TRUE(client->Wait(taskId, 100, secondTaskResult).ok());
     EXPECT_EQ(state->storeCalls, std::vector<NodeId>({20, 10}));
+}
+
+TEST(KvClientImplTest, TaskBuild_ExcludesUnhealthyNodeFromRouting)
+{
+    auto state = std::make_shared<TestState>();
+    auto client = CreateKvClient(MakeFactory(state));
+    ASSERT_TRUE(client->Init(MakeConfig({10, 20})).ok());
+    state->unhealthyNodes.insert(10);
+
+    const auto keys = FindKeysByFailover({10, 20}, 10, false, 2);
+    ASSERT_EQ(keys.size(), std::size_t{2});
+
+    TaskId taskId = kInvalidTaskId;
+    ASSERT_TRUE(client->QueryAsync(keys, taskId).ok());
+    TaskResult result;
+    const auto status = client->Wait(taskId, 1000, result);
+
+    EXPECT_TRUE(status.ok()) << status.message;
+    for (const auto& entryStatus : result.entryStatus) { EXPECT_TRUE(entryStatus.ok()); }
+    EXPECT_EQ(state->queryCalls, std::vector<NodeId>({20}));
+}
+
+TEST(KvClientImplTest, TaskBuild_UnroutableEntriesReportNoAvailableNode)
+{
+    auto state = std::make_shared<TestState>();
+    auto client = CreateKvClient(MakeFactory(state));
+    ASSERT_TRUE(client->Init(MakeConfig({10})).ok());
+    state->unhealthyNodes.insert(10);
+
+    TaskId taskId = kInvalidTaskId;
+    ASSERT_TRUE(client->QueryAsync({MakeCacheKey("k05"), MakeCacheKey("k15")}, taskId).ok());
+    TaskResult result;
+    const auto status = client->Wait(taskId, 1000, result);
+
+    EXPECT_EQ(status.code, StatusCode::PARTIAL_FAILED);
+    ASSERT_EQ(result.entryStatus.size(), std::size_t{2});
+    for (const auto& entryStatus : result.entryStatus) {
+        EXPECT_EQ(entryStatus.code, StatusCode::NO_AVAILABLE_NODE);
+    }
+    EXPECT_TRUE(state->queryCalls.empty());
+    EXPECT_TRUE(state->submittedOpTypes.empty());
+}
+
+TEST(KvClientImplTest, TaskBuild_PartialFailureKeepsRoutableEntries)
+{
+    auto state = std::make_shared<TestState>();
+    auto client = CreateKvClient(MakeFactory(state));
+    ASSERT_TRUE(client->Init(MakeConfig({10, 20})).ok());
+    state->unhealthyNodes.insert(10);
+
+    const auto noOwnerKeys = FindKeysByFailover({10, 20}, 10, true, 1);
+    ASSERT_EQ(noOwnerKeys.size(), std::size_t{1});
+    const auto failoverKeys = FindKeysByFailover({10, 20}, 10, false, 1);
+    ASSERT_EQ(failoverKeys.size(), std::size_t{1});
+    const auto healthyKey = FindKeyForAsu({10, 20}, 20);
+    ASSERT_NE(healthyKey, CacheKey{});
+
+    TaskId taskId = kInvalidTaskId;
+    ASSERT_TRUE(client->QueryAsync({noOwnerKeys[0], failoverKeys[0], healthyKey}, taskId).ok());
+    TaskResult result;
+    const auto status = client->Wait(taskId, 1000, result);
+
+    EXPECT_EQ(status.code, StatusCode::PARTIAL_FAILED);
+    ASSERT_EQ(result.entryStatus.size(), std::size_t{3});
+    EXPECT_EQ(result.entryStatus[0].code, StatusCode::NO_AVAILABLE_NODE);
+    EXPECT_TRUE(result.entryStatus[1].ok());
+    EXPECT_TRUE(result.entryStatus[2].ok());
+    EXPECT_EQ(state->queryCalls, std::vector<NodeId>({20}));
 }
 
 }  // namespace kv::test
