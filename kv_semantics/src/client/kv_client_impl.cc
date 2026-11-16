@@ -41,6 +41,27 @@ namespace kv {
 
 namespace {
 
+bool SameEndpoints(const std::vector<NodeEndpoint>& lhs, const std::vector<NodeEndpoint>& rhs)
+{
+    if (lhs.size() != rhs.size()) { return false; }
+    for (std::size_t index = 0; index < lhs.size(); ++index) {
+        const auto& left = lhs[index];
+        const auto& right = rhs[index];
+        if (left.ip != right.ip || left.port != right.port || left.protocol != right.protocol ||
+            left.numaNode != right.numaNode || left.hcaName != right.hcaName ||
+            left.hcaPort != right.hcaPort || left.attrs != right.attrs) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsM800ViewProvider(const KvClientConfig& config)
+{
+    auto iter = config.attrs.find("view.provider");
+    return iter != config.attrs.end() && iter->second == "m800";
+}
+
 struct SubmitMetrics {
     metrics::CachedMetric* requests;
     metrics::CachedMetric* entries;
@@ -117,6 +138,7 @@ Status KvClientImpl::Init(const KvClientConfig& config)
     }
 
     config_ = config;
+    transportPoolEnabled_ = IsM800ViewProvider(config);
     viewServer_ = viewServerFactory_(config);
     if (viewServer_ == nullptr) {
         return Status::Error(StatusCode::NOT_INITIALIZED, "view server factory returned null");
@@ -152,9 +174,13 @@ Status KvClientImpl::Init(const KvClientConfig& config)
     std::shared_ptr<ViewSnapshot> nextSnapshot;
     status = BuildSnapshot(view, nullptr, nextSnapshot);
     if (!status.ok()) {
-        std::lock_guard<std::mutex> memoryLock{memoryMu_};
-        providerMemoryStates_.clear();
-        memoryProvider_.reset();
+        (void)CloseTransportPool();
+        {
+            std::lock_guard<std::mutex> memoryLock{memoryMu_};
+            providerMemoryStates_.clear();
+            memoryProvider_.reset();
+        }
+        transportPoolEnabled_ = false;
         return status;
     }
 
@@ -203,14 +229,22 @@ Status KvClientImpl::Shutdown()
     Status finalStatus = Status::OK();
     auto drainStatus = taskManager_.Drain(waitTimeoutMs);
     if (!drainStatus.ok()) { finalStatus = drainStatus; }
-    if (snapshot) {
-        auto shutdownStatus = ShutdownSnapshotTransports(snapshot);
-        if (!shutdownStatus.ok() && finalStatus.ok()) { finalStatus = shutdownStatus; }
-    }
-    for (auto& transport : retiredTransports) {
-        if (transport == nullptr) { continue; }
-        auto status = transport->Shutdown();
-        if (!status.ok() && finalStatus.ok()) { finalStatus = status; }
+    if (transportPoolEnabled_) {
+        // Pooled transports are referenced by the snapshot but owned by the pool. Closing
+        // the pool once is enough; closing the snapshot as well would shut them down twice.
+        auto poolStatus = CloseTransportPool();
+        if (!poolStatus.ok() && finalStatus.ok()) { finalStatus = poolStatus; }
+        transportPoolEnabled_ = false;
+    } else {
+        if (snapshot) {
+            auto shutdownStatus = ShutdownSnapshotTransports(snapshot);
+            if (!shutdownStatus.ok() && finalStatus.ok()) { finalStatus = shutdownStatus; }
+        }
+        for (auto& transport : retiredTransports) {
+            if (transport == nullptr) { continue; }
+            auto status = transport->Shutdown();
+            if (!status.ok() && finalStatus.ok()) { finalStatus = status; }
+        }
     }
     const auto unregisterState = [this, &finalStatus](const ProviderMemoryState& state) {
         std::vector<MRHandle> localHandles;
@@ -605,20 +639,23 @@ Status KvClientImpl::BuildSnapshot(const GlobalView& view,
 
     for (std::size_t asuIndex = 0; asuIndex < asuIds.size(); ++asuIndex) {
         auto nodeId = asuIds[asuIndex];
+        auto viewIter = view.asuMap.find(nodeId);
+        auto asuInfo = viewIter == view.asuMap.end() ? NodeInfo{} : viewIter->second;
         std::shared_ptr<AsuTransport> transport;
-        if (oldSnapshot != nullptr) {
-            auto oldIter = oldSnapshot->transports.find(nodeId);
-            if (oldIter != oldSnapshot->transports.end()) { transport = oldIter->second; }
-        }
-
-        if (transport == nullptr) {
-            auto viewIter = view.asuMap.find(nodeId);
-            auto asuInfo = viewIter == view.asuMap.end() ? NodeInfo{} : viewIter->second;
-            auto status = BuildTransport(nodeId, asuInfo, transport);
-            if (!status.ok()) {
-                return WithContext(status, "asuIndex=" + std::to_string(asuIndex) +
-                                               " nodeId=" + std::to_string(nodeId));
+        Status status = Status::OK();
+        if (transportPoolEnabled_) {
+            // The pool owns the transport; the snapshot only keeps a reference to it.
+            status = GetOrCreateTransport(nodeId, asuInfo, transport);
+        } else {
+            if (oldSnapshot != nullptr) {
+                auto oldIter = oldSnapshot->transports.find(nodeId);
+                if (oldIter != oldSnapshot->transports.end()) { transport = oldIter->second; }
             }
+            if (transport == nullptr) { status = BuildTransport(nodeId, asuInfo, transport); }
+        }
+        if (!status.ok()) {
+            return WithContext(status, "asuIndex=" + std::to_string(asuIndex) +
+                                           " nodeId=" + std::to_string(nodeId));
         }
 
         nextSnapshot->transports.emplace(nodeId, std::move(transport));
@@ -652,7 +689,13 @@ Status KvClientImpl::BuildTransport(NodeId nodeId, const NodeInfo& asuInfo,
         config = configIter->second;
     }
     ApplyAsuInfoToTransportConfig(asuInfo, config);
+    return CreateTransportForNode(config, transport);
+}
 
+Status KvClientImpl::CreateTransportForNode(const TransportConfig& config,
+                                            std::shared_ptr<AsuTransport>& transport)
+{
+    const auto nodeId = config.nodeId;
     std::lock_guard<std::mutex> memoryLock{memoryMu_};
     std::shared_ptr<TransProvider> transProvider;
     if (config_.sharedProviderMode == SharedProviderMode::SHARED) {
@@ -708,6 +751,80 @@ Status KvClientImpl::BuildTransport(NodeId nodeId, const NodeInfo& asuInfo,
     providerMemoryStates_.emplace_back(std::move(providerState));
     transport = std::shared_ptr<AsuTransport>(std::move(nextTransport));
     return Status::OK();
+}
+
+Status KvClientImpl::BuildTransportConfigForNode(NodeId nodeId, const NodeInfo& asuInfo,
+                                                 TransportConfig& config) const
+{
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        auto configIter = transportConfigs_.find(nodeId);
+        if (configIter != transportConfigs_.end()) {
+            config = configIter->second;
+        } else if (!config_.transportConfigs.empty()) {
+            // Dynamic node: clone the first configured entry, its nodeId is a placeholder.
+            config = config_.transportConfigs.front();
+        } else {
+            return Status::Error(StatusCode::NOT_FOUND,
+                                 "transport config template not found, nodeId=" +
+                                     std::to_string(nodeId));
+        }
+    }
+
+    config.nodeId = nodeId;
+    ApplyAsuInfoToTransportConfig(asuInfo, config);
+    // The namespace id belongs to each transport task, never to a shared transport config.
+    config.attrs.erase("kv_ns_id");
+    return Status::OK();
+}
+
+Status KvClientImpl::GetOrCreateTransport(NodeId nodeId, const NodeInfo& asuInfo,
+                                          std::shared_ptr<AsuTransport>& transport)
+{
+    std::lock_guard<std::mutex> poolLock{transportPoolMu_};
+
+    TransportConfig config;
+    auto status = BuildTransportConfigForNode(nodeId, asuInfo, config);
+    if (!status.ok()) { return status; }
+
+    auto poolIter = transportPool_.find(nodeId);
+    if (poolIter != transportPool_.end()) {
+        auto endpointIter = transportEndpoints_.find(nodeId);
+        if (endpointIter == transportEndpoints_.end() ||
+            !SameEndpoints(endpointIter->second, config.endpoints)) {
+            return Status::Error(StatusCode::INTERNAL_ERROR,
+                                 "transport endpoint changed, nodeId=" + std::to_string(nodeId));
+        }
+        transport = poolIter->second;
+        return Status::OK();
+    }
+
+    std::shared_ptr<AsuTransport> created;
+    status = CreateTransportForNode(config, created);
+    if (!status.ok()) { return status; }
+
+    transportPool_.emplace(nodeId, created);
+    transportEndpoints_[nodeId] = config.endpoints;
+    transport = std::move(created);
+    return Status::OK();
+}
+
+Status KvClientImpl::CloseTransportPool()
+{
+    std::unordered_map<NodeId, std::shared_ptr<AsuTransport>> pool;
+    {
+        std::lock_guard<std::mutex> lock{transportPoolMu_};
+        pool.swap(transportPool_);
+        transportEndpoints_.clear();
+    }
+
+    Status failure = Status::OK();
+    for (auto& item : pool) {
+        if (item.second == nullptr) { continue; }
+        auto status = item.second->Shutdown();
+        if (!status.ok() && failure.ok()) { failure = status; }
+    }
+    return failure;
 }
 
 Status KvClientImpl::BindProviderRegions(const std::shared_ptr<TransProvider>& transProvider,
@@ -820,7 +937,7 @@ Status KvClientImpl::RefreshView()
         if (snapshot_ != nullptr && !viewServer->ShouldPublishView(snapshot_->view, view)) {
             return Status::OK();
         }
-        if (oldSnapshot != nullptr) {
+        if (!transportPoolEnabled_ && oldSnapshot != nullptr) {
             for (const auto& item : oldSnapshot->transports) {
                 if (nextSnapshot->transports.find(item.first) == nextSnapshot->transports.end()) {
                     retiredTransports_.emplace_back(item.second);

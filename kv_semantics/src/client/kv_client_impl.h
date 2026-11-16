@@ -121,6 +121,17 @@ private:
     // Creates and initializes a transport for one ASU.
     Status BuildTransport(NodeId nodeId, const NodeInfo& asuInfo,
                           std::shared_ptr<AsuTransport>& transport);
+    // Creates and initializes a transport from a ready transport config.
+    Status CreateTransportForNode(const TransportConfig& config,
+                                  std::shared_ptr<AsuTransport>& transport);
+    // Builds the transport config for a node: exact config first, template clone otherwise.
+    Status BuildTransportConfigForNode(NodeId nodeId, const NodeInfo& asuInfo,
+                                       TransportConfig& config) const;
+    // Returns the pooled transport for a node, creating and pooling it when missing.
+    Status GetOrCreateTransport(NodeId nodeId, const NodeInfo& asuInfo,
+                                std::shared_ptr<AsuTransport>& transport);
+    // Shuts down and clears every pooled transport.
+    Status CloseTransportPool();
     Status BindProviderRegions(const std::shared_ptr<TransProvider>& transProvider,
                                const std::vector<RegisteredMemory>& registeredRegions,
                                std::vector<MRHandle>& localHandles);
@@ -186,6 +197,14 @@ private:
     std::shared_ptr<ViewSnapshot> snapshot_;
     // Transports removed from the active snapshot but still needed by old tasks.
     std::vector<std::shared_ptr<AsuTransport>> retiredTransports_;
+    // Long-lived transport pool used by the multi-namespace (M800) view path.
+    std::unordered_map<NodeId, std::shared_ptr<AsuTransport>> transportPool_;
+    // Endpoints recorded when a pooled transport was created, for conflict detection.
+    std::unordered_map<NodeId, std::vector<NodeEndpoint>> transportEndpoints_;
+    // Protects transportPool_ and transportEndpoints_.
+    std::mutex transportPoolMu_;
+    // True when the view provider is M800; the pool path is only enabled then.
+    bool transportPoolEnabled_{false};
     // Worker used for non-blocking refresh requests.
     std::thread refreshThread_;
 };

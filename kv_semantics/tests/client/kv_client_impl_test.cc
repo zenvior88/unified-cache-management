@@ -72,6 +72,8 @@ struct TestState {
     std::unordered_map<NodeId, std::vector<Status>> checkEntryStatus;
     std::unordered_map<NodeId, Status> checkResultStatus;
     std::unordered_set<NodeId> unhealthyNodes;
+    std::unordered_set<NodeId> failInitNodes;
+    std::vector<NodeId> shutdownCalls;
     std::vector<NodeId> registerCalls;
     std::vector<NodeId> providerBindCalls;
     std::vector<KVBuffer> submittedEntries;
@@ -195,6 +197,9 @@ public:
                 std::shared_ptr<TransProvider> transProvider) override
     {
         (void)transProvider;
+        if (state_->failInitNodes.count(config.nodeId) != 0) {
+            return Status::Error(StatusCode::IO_ERROR, "fake transport init failure");
+        }
         config_ = config;
         state_->initConfigs[config_.nodeId] = config_;
         state_->initProviders[config_.nodeId] = transProvider.get();
@@ -212,6 +217,7 @@ public:
 
     Status Shutdown() override
     {
+        state_->shutdownCalls.emplace_back(config_.nodeId);
         initialized_ = false;
         return Status::OK();
     }
@@ -469,6 +475,76 @@ bool WaitForFetchCount(const std::shared_ptr<FakeViewServer>& viewServer,
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return false;
+}
+
+// Serves prepared GlobalView values in order; the last one repeats. Used by the transport
+// pool tests, which need view epochs and per-node endpoints.
+class ScriptedViewServer final : public ViewServer {
+public:
+    explicit ScriptedViewServer(std::vector<GlobalView> views) : views_(std::move(views)) {}
+
+    Status GetGlobalView(GlobalView& view) override
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        auto index = std::min(fetchCount_, views_.size() - 1);
+        ++fetchCount_;
+        view = views_[index];
+        return Status::OK();
+    }
+
+    std::size_t FetchCount() const
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        return fetchCount_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::size_t fetchCount_{0};
+    std::vector<GlobalView> views_;
+};
+
+GlobalView MakeEndpointView(std::uint64_t epoch, const std::vector<NodeId>& nodes,
+                            const std::string& ip = "10.0.0.1")
+{
+    GlobalView view;
+    view.viewEpoch = epoch;
+    for (auto nodeId : nodes) {
+        NodeEndpoint endpoint;
+        endpoint.ip = ip;
+        endpoint.port = 1000;
+        NodeInfo info;
+        info.endpoints.push_back(endpoint);
+        view.asuMap.emplace(nodeId, info);
+    }
+    return view;
+}
+
+KvClientConfig MakePooledConfig(const std::vector<NodeId>& asuIds)
+{
+    auto config = MakeConfig(asuIds);
+    config.attrs["view.provider"] = "m800";
+    return config;
+}
+
+template <typename ViewServerT>
+bool WaitForFetchCount(const std::shared_ptr<ViewServerT>& viewServer,
+                       std::size_t expectedFetchCount)
+{
+    for (std::uint32_t attempt = 0; attempt < 100; ++attempt) {
+        if (viewServer->FetchCount() >= expectedFetchCount) { return true; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
+// Produces one failing query so the client requests a background view refresh.
+void TriggerViewRefresh(KvClient& client, const std::shared_ptr<TestState>& state)
+{
+    state->failFirstQuery = true;
+    state->firstQueryFailed = false;
+    QueryResult result;
+    (void)QueryAndWait(client, {MakeCacheKey("refresh-trigger")}, result);
 }
 
 bool CheckUntilComplete(KvClient& client, TaskId taskId)
@@ -2419,6 +2495,135 @@ TEST(KvClientImplTest, TaskBuild_PartialFailureKeepsRoutableEntries)
     EXPECT_TRUE(result.entryStatus[1].ok());
     EXPECT_TRUE(result.entryStatus[2].ok());
     EXPECT_EQ(state->queryCalls, std::vector<NodeId>({20}));
+}
+
+TEST(KvClientImplTest, TransportPool_ReusesTransportAcrossViews)
+{
+    auto state = std::make_shared<TestState>();
+    auto viewServer = std::make_shared<ScriptedViewServer>(std::vector<GlobalView>{
+        MakeEndpointView(1, {10, 20}),
+        MakeEndpointView(2, {10, 20}),
+    });
+    auto client =
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+    ASSERT_TRUE(client->Init(MakePooledConfig({10, 20})).ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{2});
+
+    TriggerViewRefresh(*client, state);
+    ASSERT_TRUE(WaitForFetchCount(viewServer, 2));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    EXPECT_EQ(state->createdTransports, std::uint32_t{2});
+    EXPECT_TRUE(state->shutdownCalls.empty());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, TransportPool_KeepsTransportWhenNodeLeavesView)
+{
+    auto state = std::make_shared<TestState>();
+    auto viewServer = std::make_shared<ScriptedViewServer>(std::vector<GlobalView>{
+        MakeEndpointView(1, {10, 20}),
+        MakeEndpointView(2, {10}),
+        MakeEndpointView(3, {10, 20}),
+    });
+    auto client =
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+    ASSERT_TRUE(client->Init(MakePooledConfig({10, 20})).ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{2});
+
+    TriggerViewRefresh(*client, state);
+    ASSERT_TRUE(WaitForFetchCount(viewServer, 2));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(state->createdTransports, std::uint32_t{2});
+    EXPECT_TRUE(state->shutdownCalls.empty());
+
+    TriggerViewRefresh(*client, state);
+    ASSERT_TRUE(WaitForFetchCount(viewServer, 3));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(state->createdTransports, std::uint32_t{2});
+
+    ASSERT_TRUE(client->Shutdown().ok());
+    EXPECT_EQ(state->shutdownCalls.size(), std::size_t{2});
+}
+
+TEST(KvClientImplTest, TransportPool_FailsRefreshOnEndpointChange)
+{
+    auto state = std::make_shared<TestState>();
+    auto viewServer = std::make_shared<ScriptedViewServer>(std::vector<GlobalView>{
+        MakeEndpointView(1, {10}, "10.0.0.1"),
+        MakeEndpointView(2, {10}, "10.0.0.2"),
+    });
+    auto client =
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+    ASSERT_TRUE(client->Init(MakePooledConfig({10})).ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+
+    TriggerViewRefresh(*client, state);
+    ASSERT_TRUE(WaitForFetchCount(viewServer, 2));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+    QueryResult result;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, TransportPool_ClonesTemplateForDynamicNode)
+{
+    auto state = std::make_shared<TestState>();
+    auto viewServer = std::make_shared<ScriptedViewServer>(std::vector<GlobalView>{
+        MakeEndpointView(1, {10, 20}),
+    });
+    auto client =
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+    auto config = MakePooledConfig({999});
+    config.transportConfigs[0].attrs["kv_ns_id"] = "7";
+    config.transportConfigs[0].attrs["dtype"] = "1";
+    ASSERT_TRUE(client->Init(config).ok());
+
+    ASSERT_EQ(state->initConfigs.count(10), std::size_t{1});
+    const auto& created = state->initConfigs.at(10);
+    EXPECT_EQ(created.nodeId, NodeId{10});
+    ASSERT_EQ(created.endpoints.size(), std::size_t{1});
+    EXPECT_EQ(created.endpoints[0].ip, "10.0.0.1");
+    EXPECT_EQ(created.attrs.count("kv_ns_id"), std::size_t{0});
+    EXPECT_EQ(created.attrs.at("dtype"), "1");
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, TransportPool_DoesNotPoolFailedInit)
+{
+    auto state = std::make_shared<TestState>();
+    auto viewServer = std::make_shared<ScriptedViewServer>(std::vector<GlobalView>{
+        MakeEndpointView(1, {10}),
+    });
+    auto client =
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+
+    state->failInitNodes.insert(10);
+    EXPECT_FALSE(client->Init(MakePooledConfig({10})).ok());
+
+    state->failInitNodes.clear();
+    ASSERT_TRUE(client->Init(MakePooledConfig({10})).ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{2});
+    QueryResult result;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, TransportPool_ShutdownClosesEachTransportOnce)
+{
+    auto state = std::make_shared<TestState>();
+    auto viewServer = std::make_shared<ScriptedViewServer>(std::vector<GlobalView>{
+        MakeEndpointView(1, {10, 20}),
+    });
+    auto client =
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+    ASSERT_TRUE(client->Init(MakePooledConfig({10, 20})).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
+
+    std::sort(state->shutdownCalls.begin(), state->shutdownCalls.end());
+    EXPECT_EQ(state->shutdownCalls, std::vector<NodeId>({10, 20}));
 }
 
 }  // namespace kv::test
