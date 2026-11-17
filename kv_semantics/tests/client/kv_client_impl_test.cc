@@ -16,12 +16,14 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 #include "kv_metrics/metrics.h"
 #include "router/router.h"
+#include "transport/asu_transport_pool.h"
 #include "utils/config_utils.h"
 
 namespace kv::test {
@@ -194,6 +196,7 @@ private:
 class FakeTransport : public AsuTransport {
 public:
     explicit FakeTransport(std::shared_ptr<TestState> state) : state_(std::move(state)) {}
+    ~FakeTransport() override { (void)Shutdown(); }
 
     Status Init(const TransportConfig& config,
                 std::shared_ptr<TransProvider> transProvider) override
@@ -219,6 +222,8 @@ public:
 
     Status Shutdown() override
     {
+        if (shutdownCalled_) { return Status::OK(); }
+        shutdownCalled_ = true;
         state_->shutdownCalls.emplace_back(config_.nodeId);
         initialized_ = false;
         return Status::OK();
@@ -397,6 +402,8 @@ private:
     std::shared_ptr<TestState> state_;
     TransportConfig config_;
     bool initialized_{false};
+
+    bool shutdownCalled_{false};
 };
 
 bool InvokePendingCompletion(const std::shared_ptr<TestState>& state, NodeId nodeId,
@@ -2651,8 +2658,10 @@ TEST(KvClientImplTest, TransportPool_KeepsTransportWhenNodeLeavesView)
     EXPECT_EQ(state->shutdownCalls.size(), std::size_t{2});
 }
 
-TEST(KvClientImplTest, TransportPool_FailsRefreshOnEndpointChange)
+TEST(KvClientImplTest, TransportPool_RebuildsOnEndpointChange)
 {
+    // The same node moves to a new address: the refresh rebuilds the connection instead
+    // of failing forever with the stale one.
     auto state = std::make_shared<TestState>();
     auto viewServer = std::make_shared<ScriptedViewServer>(std::vector<GlobalView>{
         MakeEndpointView(1, {10}, "10.0.0.1"),
@@ -2665,9 +2674,12 @@ TEST(KvClientImplTest, TransportPool_FailsRefreshOnEndpointChange)
 
     TriggerViewRefresh(*client, state);
     ASSERT_TRUE(WaitForFetchCount(viewServer, 2));
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ASSERT_TRUE(WaitFor([&] { return state->createdTransports == 2; }));
 
-    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+    ASSERT_EQ(state->initConfigs.count(NodeId{10}), std::size_t{1});
+    ASSERT_EQ(state->initConfigs.at(NodeId{10}).endpoints.size(), std::size_t{1});
+    EXPECT_EQ(state->initConfigs.at(NodeId{10}).endpoints[0].ip, "10.0.0.2");
+
     QueryResult result;
     EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
     ASSERT_TRUE(client->Shutdown().ok());
@@ -3174,6 +3186,183 @@ TEST(KvClientImplTest, Refresh_DefaultSchedulerRefreshesOnTimer)
 
     EXPECT_TRUE(WaitFor([&] { return state->createdTransports == 2; },
                         std::chrono::milliseconds(3000)));
+
+    QueryResult result;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+
+TEST(AsuTransportPoolTest, ReusesTransportPerNode)
+{
+    auto state = std::make_shared<TestState>();
+    AsuTransportPool pool([state](const TransportConfig&, std::shared_ptr<AsuTransport>& out) {
+        ++state->createdTransports;
+        out = std::make_shared<FakeTransport>(state);
+        return Status::OK();
+    });
+
+    TransportConfig config;
+    config.nodeId = 10;
+    std::shared_ptr<AsuTransport> first;
+    std::shared_ptr<AsuTransport> second;
+    ASSERT_TRUE(pool.GetOrCreate(config, first).ok());
+    ASSERT_TRUE(pool.GetOrCreate(config, second).ok());
+
+    EXPECT_EQ(first, second);
+    EXPECT_EQ(state->createdTransports, 1U);
+    EXPECT_EQ(pool.Size(), std::size_t{1});
+    EXPECT_EQ(pool.Find(NodeId{10}), first);
+    EXPECT_EQ(pool.GetTransports().size(), std::size_t{1});
+    EXPECT_EQ(pool.Find(NodeId{99}), nullptr);
+
+    ASSERT_TRUE(pool.ShutdownAll().ok());
+    EXPECT_EQ(pool.Size(), std::size_t{0});
+}
+
+TEST(AsuTransportPoolTest, RebuildsConnectionOnEndpointChange)
+{
+    auto state = std::make_shared<TestState>();
+    AsuTransportPool pool([state](const TransportConfig& config,
+                                  std::shared_ptr<AsuTransport>& out) {
+        ++state->createdTransports;
+        auto transport = std::make_shared<FakeTransport>(state);
+        auto status = transport->Init(config, nullptr);
+        if (!status.ok()) { return status; }
+        out = transport;
+        return Status::OK();
+    });
+
+    NodeEndpoint endpoint;
+    endpoint.ip = "10.0.0.1";
+    endpoint.port = 1000;
+    TransportConfig config;
+    config.nodeId = 10;
+    config.endpoints = {endpoint};
+
+    std::shared_ptr<AsuTransport> original;
+    ASSERT_TRUE(pool.GetOrCreate(config, original).ok());
+
+    TransportConfig moved = config;
+    moved.endpoints[0].ip = "10.0.0.2";
+    std::shared_ptr<AsuTransport> rebuilt;
+    EXPECT_EQ(pool.GetOrCreate(moved, rebuilt).code, StatusCode::ENDPOINT_CHANGED);
+    ASSERT_TRUE(pool.Replace(moved, rebuilt).ok());
+    EXPECT_NE(rebuilt, original);
+    EXPECT_EQ(state->createdTransports, 2U);
+    EXPECT_EQ(pool.Size(), std::size_t{1});
+    EXPECT_EQ(pool.Find(NodeId{10}), rebuilt);
+
+    // The new endpoints are recorded: the same config is reused, not rebuilt again.
+    std::shared_ptr<AsuTransport> reused;
+    ASSERT_TRUE(pool.GetOrCreate(moved, reused).ok());
+    EXPECT_EQ(reused, rebuilt);
+    EXPECT_EQ(state->createdTransports, 2U);
+
+    // The previous transport is released, not shut down: it closes when its last
+    // reference drops, which keeps in-flight tasks safe.
+    EXPECT_TRUE(state->shutdownCalls.empty());
+    original.reset();
+    ASSERT_EQ(state->shutdownCalls.size(), std::size_t{1});
+    EXPECT_EQ(state->shutdownCalls[0], NodeId{10});
+
+    ASSERT_TRUE(pool.ShutdownAll().ok());
+    EXPECT_EQ(state->shutdownCalls.size(), std::size_t{2});
+}
+
+TEST(AsuTransportPoolTest, ShutdownAllShutsEveryTransportOnce)
+{
+    auto state = std::make_shared<TestState>();
+    AsuTransportPool pool([state](const TransportConfig&, std::shared_ptr<AsuTransport>& out) {
+        out = std::make_shared<FakeTransport>(state);
+        return Status::OK();
+    });
+
+    for (NodeId nodeId : {NodeId{10}, NodeId{20}}) {
+        TransportConfig config;
+        config.nodeId = nodeId;
+        std::shared_ptr<AsuTransport> transport;
+        ASSERT_TRUE(pool.GetOrCreate(config, transport).ok());
+    }
+
+    ASSERT_TRUE(pool.ShutdownAll().ok());
+    EXPECT_EQ(state->shutdownCalls.size(), std::size_t{2});
+
+    // Closing an empty pool is a no-op, not a second shutdown of the same transports.
+    ASSERT_TRUE(pool.ShutdownAll().ok());
+    EXPECT_EQ(state->shutdownCalls.size(), std::size_t{2});
+}
+
+TEST(AsuTransportPoolTest, CannotBeCopiedOrMoved)
+{
+    static_assert(!std::is_copy_constructible_v<AsuTransportPool>);
+    static_assert(!std::is_copy_assignable_v<AsuTransportPool>);
+    static_assert(!std::is_move_constructible_v<AsuTransportPool>);
+    static_assert(!std::is_move_assignable_v<AsuTransportPool>);
+}
+
+
+TEST(AsuTransportPoolTest, ComparesEndpointsAsSet)
+{
+    auto state = std::make_shared<TestState>();
+    AsuTransportPool pool([state](const TransportConfig&, std::shared_ptr<AsuTransport>& out) {
+        out = std::make_shared<FakeTransport>(state);
+        return Status::OK();
+    });
+
+    NodeEndpoint firstEndpoint;
+    firstEndpoint.ip = "10.0.0.1";
+    firstEndpoint.port = 1000;
+    NodeEndpoint secondEndpoint;
+    secondEndpoint.ip = "10.0.0.2";
+    secondEndpoint.port = 2000;
+
+    TransportConfig config;
+    config.nodeId = 10;
+    config.endpoints = {firstEndpoint, secondEndpoint};
+
+    std::shared_ptr<AsuTransport> transport;
+    ASSERT_TRUE(pool.GetOrCreate(config, transport).ok());
+
+    // The same addresses in a different order are the same endpoint set.
+    TransportConfig reordered = config;
+    reordered.endpoints = {secondEndpoint, firstEndpoint};
+    std::shared_ptr<AsuTransport> reused;
+    ASSERT_TRUE(pool.GetOrCreate(reordered, reused).ok());
+    EXPECT_EQ(reused, transport);
+
+    // A genuinely different address is reported, and Replace rebuilds it.
+    TransportConfig changed = config;
+    changed.endpoints[0].port = 3000;
+    std::shared_ptr<AsuTransport> rejected;
+    EXPECT_EQ(pool.GetOrCreate(changed, rejected).code, StatusCode::ENDPOINT_CHANGED);
+    std::shared_ptr<AsuTransport> rebuilt;
+    ASSERT_TRUE(pool.Replace(changed, rebuilt).ok());
+    EXPECT_NE(rebuilt, reused);
+}
+
+
+TEST(KvClientImplTest, Refresh_AdoptsChangedEndpoints)
+{
+    // The same node reports a new address in the newer view: the refresh must rebuild
+    // that connection instead of failing and keeping the stale one forever.
+    auto state = std::make_shared<TestState>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(std::vector<UniverseScript>{
+        MakeScript(1, {{100, MakeEndpointView(1, {10}, "10.0.0.1")}}),
+        MakeScript(2, {{100, MakeEndpointView(2, {10}, "10.0.0.2")}}),
+    });
+    auto client =
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+    ASSERT_TRUE(client->Init(MakeConfig({10})).ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+
+    TriggerRefreshByIoFailure(*client, state);
+    EXPECT_TRUE(WaitFor([&] { return state->createdTransports == 2; }));
+
+    // The rebuilt transport carries the new endpoint.
+    ASSERT_EQ(state->initConfigs.count(NodeId{10}), std::size_t{1});
+    ASSERT_EQ(state->initConfigs.at(NodeId{10}).endpoints.size(), std::size_t{1});
+    EXPECT_EQ(state->initConfigs.at(NodeId{10}).endpoints[0].ip, "10.0.0.2");
 
     QueryResult result;
     EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());

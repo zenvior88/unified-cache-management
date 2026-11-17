@@ -36,26 +36,12 @@
 #include "router/config.h"
 #include "router/router.h"
 #include "utils/config_utils.h"
+#include "transport/asu_transport_pool.h"
 #include "view/threaded_refresh_scheduler.h"
 
 namespace kv {
 
 namespace {
-
-bool SameEndpoints(const std::vector<NodeEndpoint>& lhs, const std::vector<NodeEndpoint>& rhs)
-{
-    if (lhs.size() != rhs.size()) { return false; }
-    for (std::size_t index = 0; index < lhs.size(); ++index) {
-        const auto& left = lhs[index];
-        const auto& right = rhs[index];
-        if (left.ip != right.ip || left.port != right.port || left.protocol != right.protocol ||
-            left.numaNode != right.numaNode || left.hcaName != right.hcaName ||
-            left.hcaPort != right.hcaPort || left.attrs != right.attrs) {
-            return false;
-        }
-    }
-    return true;
-}
 
 struct SubmitMetrics {
     metrics::CachedMetric* requests;
@@ -113,7 +99,11 @@ KvClientImpl::KvClientImpl(TransportFactory transportFactory, ViewServerFactory 
                            TransProviderFactory transProviderFactory)
     : transportFactory_(std::move(transportFactory)),
       transProviderFactory_(std::move(transProviderFactory)),
-      viewServerFactory_(std::move(viewServerFactory))
+      viewServerFactory_(std::move(viewServerFactory)),
+      transportPool_([this](const TransportConfig& config,
+                            std::shared_ptr<AsuTransport>& transport) {
+          return CreateTransportForNode(config, transport);
+      })
 {
     if (!transportFactory_) { transportFactory_ = CreateAsuTransport; }
     if (!transProviderFactory_) { transProviderFactory_ = CreateTransProvider; }
@@ -175,7 +165,7 @@ Status KvClientImpl::Init(const KvClientConfig& config)
         status = ApplyUniverse(universe, std::move(initialSnapshots), true);
     }
     if (!status.ok()) {
-        (void)CloseTransportPool();
+        (void)transportPool_.ShutdownAll();
         {
             std::lock_guard<std::mutex> memoryLock{memoryMu_};
             providerMemoryStates_.clear();
@@ -243,7 +233,7 @@ Status KvClientImpl::Shutdown()
     auto drainStatus = taskManager_.Drain(waitTimeoutMs);
     if (!drainStatus.ok()) { finalStatus = drainStatus; }
     // The pool owns every transport, so closing it once releases all connections.
-    auto poolStatus = CloseTransportPool();
+    auto poolStatus = transportPool_.ShutdownAll();
     if (!poolStatus.ok() && finalStatus.ok()) { finalStatus = poolStatus; }
     const auto unregisterState = [this, &finalStatus](const ProviderMemoryState& state) {
         std::vector<MRHandle> localHandles;
@@ -805,50 +795,15 @@ Status KvClientImpl::BuildTransportConfigForNode(NodeId nodeId, const NodeInfo& 
 Status KvClientImpl::GetOrCreateTransport(NodeId nodeId, const NodeInfo& asuInfo,
                                           std::shared_ptr<AsuTransport>& transport)
 {
-    std::lock_guard<std::mutex> poolLock{transportPoolMu_};
-
     TransportConfig config;
     auto status = BuildTransportConfigForNode(nodeId, asuInfo, config);
     if (!status.ok()) { return status; }
 
-    auto poolIter = transportPool_.find(nodeId);
-    if (poolIter != transportPool_.end()) {
-        auto endpointIter = transportEndpoints_.find(nodeId);
-        if (endpointIter == transportEndpoints_.end() ||
-            !SameEndpoints(endpointIter->second, config.endpoints)) {
-            return Status::Error(StatusCode::INTERNAL_ERROR,
-                                 "transport endpoint changed, nodeId=" + std::to_string(nodeId));
-        }
-        transport = poolIter->second;
-        return Status::OK();
-    }
+    status = transportPool_.GetOrCreate(config, transport);
+    if (status.code != StatusCode::ENDPOINT_CHANGED) { return status; }
 
-    std::shared_ptr<AsuTransport> created;
-    status = CreateTransportForNode(config, created);
-    if (!status.ok()) { return status; }
-
-    transportPool_.emplace(nodeId, created);
-    transportEndpoints_[nodeId] = config.endpoints;
-    transport = std::move(created);
-    return Status::OK();
-}
-
-Status KvClientImpl::CloseTransportPool()
-{
-    std::unordered_map<NodeId, std::shared_ptr<AsuTransport>> pool;
-    {
-        std::lock_guard<std::mutex> lock{transportPoolMu_};
-        pool.swap(transportPool_);
-        transportEndpoints_.clear();
-    }
-
-    Status failure = Status::OK();
-    for (auto& item : pool) {
-        if (item.second == nullptr) { continue; }
-        auto status = item.second->Shutdown();
-        if (!status.ok() && failure.ok()) { failure = status; }
-    }
-    return failure;
+    // The viewed endpoints moved; keep IO running by rebuilding this node's connection.
+    return transportPool_.Replace(config, transport);
 }
 
 Status KvClientImpl::BindProviderRegions(const std::shared_ptr<TransProvider>& transProvider,

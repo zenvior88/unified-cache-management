@@ -35,12 +35,14 @@
 #include "kv_client.h"
 #include "kv_types.h"
 #include "spsc_ring_queue.h"
+#include "transport/asu_transport_pool.h"
 #include "task/task_manager.h"
 #include "view/refresh_scheduler.h"
 #include "view/view_server.h"
 
 namespace kv {
 class Router;
+class AsuTransportPool;
 }  // namespace kv
 
 namespace kv {
@@ -148,8 +150,6 @@ private:
     // Returns the pooled transport for a node, creating and pooling it when missing.
     Status GetOrCreateTransport(NodeId nodeId, const NodeInfo& asuInfo,
                                 std::shared_ptr<AsuTransport>& transport);
-    // Shuts down and clears every pooled transport.
-    Status CloseTransportPool();
     Status BindProviderRegions(const std::shared_ptr<TransProvider>& transProvider,
                                const std::vector<RegisteredMemory>& registeredRegions,
                                std::vector<MRHandle>& localHandles);
@@ -236,12 +236,8 @@ private:
     std::shared_ptr<ViewUniverse> viewUniverse_;
     // Resident refresh scheduler; created by Init and stopped by Shutdown.
     std::unique_ptr<RefreshScheduler> refreshScheduler_;
-    // Long-lived transport pool.
-    std::unordered_map<NodeId, std::shared_ptr<AsuTransport>> transportPool_;
-    // Endpoints recorded when a pooled transport was created, for conflict detection.
-    std::unordered_map<NodeId, std::vector<NodeEndpoint>> transportEndpoints_;
-    // Protects transportPool_ and transportEndpoints_.
-    std::mutex transportPoolMu_;
+    // Owns every AsuTransport of this client; closed by Shutdown.
+    AsuTransportPool transportPool_;
 };
 
 }  // namespace kv
