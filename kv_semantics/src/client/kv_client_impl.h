@@ -53,6 +53,7 @@ std::unique_ptr<KvClient> CreateKvClient(TransportFactory transportFactory,
 
 // ViewSnapshot is the immutable routing state used by foreground IO and submitted tasks.
 struct ViewSnapshot {
+    KvNsId nsId{kDefaultKvNsId};
     std::shared_ptr<kv::Router> router;
     std::vector<NodeId> asuIds;
     GlobalView view;
@@ -86,6 +87,14 @@ public:
     // Submits delete operations to routed transports.
     Status DeleteAsync(const std::vector<CacheKey>& keys, TaskId& taskId) override;
 
+    // Namespace-aware submissions. They select the snapshot of the given namespace
+    // and are the entry point used by the public API once it carries KvNsId.
+    Status QueryAsync(KvNsId nsId, const std::vector<CacheKey>& keys, TaskId& taskId);
+    Status LoadAsync(KvNsId nsId, const std::vector<KVBuffer>& entries, TaskId& taskId);
+    Status StoreAsync(KvNsId nsId, const std::vector<KVBuffer>& entries, TaskId& taskId,
+                      std::function<Status()> prerequisite = {});
+    Status DeleteAsync(KvNsId nsId, const std::vector<CacheKey>& keys, TaskId& taskId);
+
     // Checks an aggregate task.
     bool Check(TaskId taskId) override;
     // Waits for an aggregate task.
@@ -108,6 +117,11 @@ private:
                        std::function<Status()> prerequisite = {});
     // Creates and queues one key-based client task.
     Status SubmitAsync(AsuOpType opType, const std::vector<CacheKey>& keys, TaskId& taskId);
+    // Namespace-aware task creation; the namespace is forwarded to every transport task.
+    Status SubmitAsync(AsuOpType opType, KvNsId nsId, const std::vector<KVBuffer>& entries,
+                       TaskId& taskId, std::function<Status()> prerequisite = {});
+    Status SubmitAsync(AsuOpType opType, KvNsId nsId, const std::vector<CacheKey>& keys,
+                       TaskId& taskId);
 
     // Runs queued tasks until shutdown and the queue are both complete.
     void WorkerLoop();
@@ -115,8 +129,9 @@ private:
     // Performs one register operation on the current snapshot.
     Status RegisterRegionsOnce(const std::vector<MemoryRegion>& regions,
                                std::vector<RegisteredMemory>& registeredRegions, bool& needRefresh);
-    // Builds a complete immutable snapshot for a view.
-    Status BuildSnapshot(const GlobalView& view, const std::shared_ptr<ViewSnapshot>& oldSnapshot,
+    // Builds a complete immutable snapshot for one namespace view.
+    Status BuildSnapshot(KvNsId nsId, const GlobalView& view,
+                         const std::shared_ptr<ViewSnapshot>& oldSnapshot,
                          std::shared_ptr<ViewSnapshot>& snapshot);
     // Creates and initializes a transport for one ASU.
     Status BuildTransport(NodeId nodeId, const NodeInfo& asuInfo,
@@ -137,8 +152,15 @@ private:
                                std::vector<MRHandle>& localHandles);
     Status UnregisterProviderRegions(const std::shared_ptr<TransProvider>& transProvider,
                                      const std::vector<MRHandle>& handles);
-    // Returns the current immutable snapshot if initialized.
-    std::shared_ptr<ViewSnapshot> GetSnapshot() const;
+    // Returns the current immutable snapshot of a namespace, or nullptr.
+    std::shared_ptr<ViewSnapshot> GetSnapshot(KvNsId nsId) const;
+    // Returns the published snapshot when exactly one namespace is published, else nullptr.
+    std::shared_ptr<ViewSnapshot> GetSingleSnapshot() const;
+    // Resolves the snapshot for a submission. Callers that pass kDefaultKvNsId have no
+    // namespace of their own and resolve to the only published namespace.
+    Status ResolveSnapshot(KvNsId nsId, std::shared_ptr<ViewSnapshot>& snapshot) const;
+    // Returns any current snapshot; used by resource paths that are namespace agnostic.
+    std::shared_ptr<ViewSnapshot> GetAnySnapshot() const;
 
     // Refreshes the view and publishes it if it is newer.
     Status RefreshView();
@@ -193,8 +215,8 @@ private:
     std::shared_ptr<TransProvider> memoryProvider_;
     // Regions registered by the client and rebound to newly added providers.
     std::unordered_map<MRHandle, RegisteredMemory> registeredRegions_;
-    // Current immutable routing and transport snapshot.
-    std::shared_ptr<ViewSnapshot> snapshot_;
+    // Current immutable routing and transport snapshots, keyed by namespace.
+    std::unordered_map<KvNsId, std::shared_ptr<ViewSnapshot>> snapshots_;
     // Transports removed from the active snapshot but still needed by old tasks.
     std::vector<std::shared_ptr<AsuTransport>> retiredTransports_;
     // Long-lived transport pool used by the multi-namespace (M800) view path.

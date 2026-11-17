@@ -336,6 +336,8 @@ Status ClientTaskManager::BuildTransportTasks(const ClientTaskPtr& task)
     for (const auto& [nodeId, indices] : routes) {
         auto transportTask = std::make_shared<TransportTask>();
         transportTask->nodeId = nodeId;
+        // M800 carries the namespace derived from the Ceph pool name on the wire.
+        transportTask->nsId = task->nsId;
         transportTask->transport = snapshot->transports.at(nodeId);
         transportTask->originalIndices.reserve(indices.size());
         if (keyBased) {

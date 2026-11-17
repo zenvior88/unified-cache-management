@@ -93,6 +93,9 @@ struct TransportTask {
     std::weak_ptr<AsuTransport> transport;
     std::vector<CacheKey> keys;
     std::vector<KVBuffer> entries;
+    // Namespace of the request. The value is forwarded to the request header, with
+    // kDefaultKvNsId acting as the default when the caller does not specify one.
+    KvNsId nsId{kDefaultKvNsId};
     std::vector<std::size_t> originalIndices;
     std::vector<Status> entryStatus;
     bool clientCompleted{false};
@@ -127,6 +130,9 @@ struct ClientTask {
     AsuOpType opType{AsuOpType::LOAD};
     std::function<Status()> prerequisite;
     std::shared_ptr<ViewSnapshot> viewSnapshot;
+    // Namespace of this client task; the snapshot is selected by it and the value is
+    // forwarded to every transport task of the batch.
+    KvNsId nsId{kDefaultKvNsId};
     std::vector<KVBuffer> entries;
     std::vector<CacheKey> keys;
     std::vector<TransportTaskPtr> transportTasks;

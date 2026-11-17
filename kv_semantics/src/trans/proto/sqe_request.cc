@@ -310,30 +310,47 @@ std::unique_ptr<SqeRequest> BuildSqeRequest(
     const std::unordered_map<std::string, std::string>& attrs, std::uint16_t cid,
     const ScatterGatherEntry& flagBuffer, TransportSubBatchContext& subBatchContext)
 {
+    // The task owns the namespace value: it is written as-is, with kDefaultKvNsId being
+    // just the default value used when the caller does not specify one.
+    const auto applyNsId = [&subBatchContext](auto& request) {
+        request.kv_ns_id = subBatchContext.nsId;
+    };
+
     switch (opcode) {
-        case KvOpcode::Store:
+        case KvOpcode::Store: {
             if (source.entries == nullptr || source.entries->size != 1) { return nullptr; }
-            return std::make_unique<KvStoreRequest>(
-                BuildStoreRequest(source.entries->data[0], attrs, cid));
-        case KvOpcode::Retrieve:
+            auto request = BuildStoreRequest(source.entries->data[0], attrs, cid);
+            applyNsId(request);
+            return std::make_unique<KvStoreRequest>(std::move(request));
+        }
+        case KvOpcode::Retrieve: {
             if (source.entries == nullptr || source.entries->size != 1) { return nullptr; }
-            return std::make_unique<KvRetrieveRequest>(
-                BuildRetrieveRequest(source.entries->data[0], attrs, cid));
-        case KvOpcode::BatchRetrieve:
+            auto request = BuildRetrieveRequest(source.entries->data[0], attrs, cid);
+            applyNsId(request);
+            return std::make_unique<KvRetrieveRequest>(std::move(request));
+        }
+        case KvOpcode::BatchRetrieve: {
             if (source.entries == nullptr) { return nullptr; }
-            return std::make_unique<KvBatchRetrieveRequest>(
-                BuildBatchRetrieveRequest(*source.entries, attrs, cid, flagBuffer));
-        case KvOpcode::BatchStore:
+            auto request = BuildBatchRetrieveRequest(*source.entries, attrs, cid, flagBuffer);
+            applyNsId(request);
+            return std::make_unique<KvBatchRetrieveRequest>(std::move(request));
+        }
+        case KvOpcode::BatchStore: {
             if (source.entries == nullptr) { return nullptr; }
-            return std::make_unique<KvBatchStoreRequest>(
-                BuildBatchStoreRequest(*source.entries, attrs, cid, flagBuffer));
-        case KvOpcode::Delete:
+            auto request = BuildBatchStoreRequest(*source.entries, attrs, cid, flagBuffer);
+            applyNsId(request);
+            return std::make_unique<KvBatchStoreRequest>(std::move(request));
+        }
+        case KvOpcode::Delete: {
             if (source.keys == nullptr) { return nullptr; }
-            return std::make_unique<KvDeleteRequest>(
-                BuildDeleteRequest(*source.keys, attrs, cid, flagBuffer));
+            auto request = BuildDeleteRequest(*source.keys, attrs, cid, flagBuffer);
+            applyNsId(request);
+            return std::make_unique<KvDeleteRequest>(std::move(request));
+        }
         case KvOpcode::Exist: {
             if (source.keys == nullptr) { return nullptr; }
             auto request = BuildExistRequest(*source.keys, attrs, cid, flagBuffer);
+            applyNsId(request);
             subBatchContext.useSeekControl = request.sc;
             return std::make_unique<KvExistRequest>(std::move(request));
         }
