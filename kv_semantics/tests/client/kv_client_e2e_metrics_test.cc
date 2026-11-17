@@ -39,7 +39,6 @@
 #include <utility>
 #include <vector>
 #include "kv_client_impl.h"
-#include "fake_refresh_scheduler.h"
 
 namespace kv::test {
 namespace {
@@ -790,8 +789,7 @@ TEST(KvClientE2EMetricsTest, NormalWorkloadReportsPrecisionPerformanceAndResourc
     auto state = std::make_shared<ClusterState>();
     auto viewServer = std::make_shared<DynamicViewServer>(state, std::vector<NodeId>{1, 2, 3});
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr,
-                                MakeAutoRefreshSchedulerFactory());
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
     ASSERT_TRUE(client->Init(MakeClientConfig({1, 2, 3})).ok());
 
     MetricsRecorder metrics;
@@ -847,8 +845,7 @@ TEST(KvClientE2EMetricsTest, DiskMembershipChangesRefreshAndContinueWorkload)
     auto state = std::make_shared<ClusterState>();
     auto viewServer = std::make_shared<DynamicViewServer>(state, std::vector<NodeId>{1, 2});
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr,
-                                MakeAutoRefreshSchedulerFactory());
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
     ASSERT_TRUE(client->Init(MakeClientConfig({1, 2, 3})).ok());
 
     MetricsRecorder metrics;

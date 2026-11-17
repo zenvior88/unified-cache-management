@@ -36,6 +36,7 @@
 #include "router/config.h"
 #include "router/router.h"
 #include "utils/config_utils.h"
+#include "view/threaded_refresh_scheduler.h"
 
 namespace kv {
 
@@ -109,12 +110,10 @@ void RecordSubmit(AsuOpType opType, std::size_t entryCount, const Status& status
 constexpr std::uint32_t kMaxShutdownDrainAttempts = 64;
 
 KvClientImpl::KvClientImpl(TransportFactory transportFactory, ViewServerFactory viewServerFactory,
-                           TransProviderFactory transProviderFactory,
-                           RefreshSchedulerFactory refreshSchedulerFactory)
+                           TransProviderFactory transProviderFactory)
     : transportFactory_(std::move(transportFactory)),
       transProviderFactory_(std::move(transProviderFactory)),
-      viewServerFactory_(std::move(viewServerFactory)),
-      refreshSchedulerFactory_(std::move(refreshSchedulerFactory))
+      viewServerFactory_(std::move(viewServerFactory))
 {
     if (!transportFactory_) { transportFactory_ = CreateAsuTransport; }
     if (!transProviderFactory_) { transProviderFactory_ = CreateTransProvider; }
@@ -191,19 +190,19 @@ Status KvClientImpl::Init(const KvClientConfig& config)
     worker_ = std::thread(&KvClientImpl::WorkerLoop, this);
     initialized_ = true;
 
-    if (refreshSchedulerFactory_) {
-        refreshScheduler_ = refreshSchedulerFactory_();
-    }
-    if (refreshScheduler_) {
-        const auto interval = GetRefreshInterval(config);
-        const auto startStatus =
-            refreshScheduler_->Start(interval, [this] { return OnViewUniverseUpdated(); });
-        if (!startStatus.ok()) {
-            KV_WARN("Refresh scheduler start failed, view refresh stays disabled: "
-                    "code={} message={}",
-                    static_cast<int>(startStatus.code), startStatus.message);
-            refreshScheduler_.reset();
-        }
+    // TODO: a factory indirection is only worth adding when a second scheduler
+    // implementation appears; the resident threaded scheduler is the only one today.
+    refreshScheduler_ = std::make_unique<ThreadedRefreshScheduler>();
+    const auto interval = GetRefreshInterval(config);
+    const auto startStatus =
+        refreshScheduler_->Start(interval, [this] { return OnViewUniverseUpdated(); });
+    if (!startStatus.ok()) {
+        // Without a scheduler the client cannot refresh, so a half-initialized client is
+        // not acceptable: roll back and report the failure.
+        KV_ERROR("Refresh scheduler start failed: code={} message={}",
+                 static_cast<int>(startStatus.code), startStatus.message);
+        (void)Shutdown();
+        return startStatus;
     }
     return Status::OK();
 }
@@ -229,7 +228,6 @@ Status KvClientImpl::Shutdown()
         std::lock_guard<std::mutex> lock{mutex_};
         snapshots_.clear();
         viewUniverse_.reset();
-        refreshScheduler_.reset();
         config_ = KvClientConfig{};
         viewServer_.reset();
         transportConfigs_.clear();
@@ -1064,9 +1062,10 @@ Status KvClientImpl::OnViewUniverseUpdated()
 
 std::chrono::milliseconds KvClientImpl::GetRefreshInterval(const KvClientConfig& config)
 {
-    // TODO: the default interval and the minimum are placeholders. Agree the production
-    // value with the view/agent owners (and decide whether it should track the agent
-    // refresh period) before enabling this on real deployments.
+    // TODO: the interval stays client-side and is handed to RefreshScheduler::Start, which
+    // only accepts values greater than zero. Open questions: the production default (it may
+    // need to follow the agent refresh period) and whether a timer-only opt-out is needed,
+    // since a zero interval would also disable IO-failure refreshes.
     constexpr std::uint64_t kDefaultIntervalMs = 30000;
     constexpr std::uint64_t kMinIntervalMs = 1000;
     std::uint64_t intervalMs = kDefaultIntervalMs;
@@ -1084,24 +1083,20 @@ std::chrono::milliseconds KvClientImpl::GetRefreshInterval(const KvClientConfig&
 
 void KvClientImpl::TriggerRefresh(const Status& status)
 {
-    std::shared_ptr<RefreshScheduler> scheduler;
-    {
-        std::lock_guard<std::mutex> lock{mutex_};
-        scheduler = refreshScheduler_;
-    }
-    if (scheduler == nullptr) {
-        // No scheduler injected means no refresh: the scheduler is the only driver.
-        return;
-    }
-    scheduler->TriggerByIoFailure(status);
+    // The scheduler call is short and never re-enters the client, so holding mutex_ keeps
+    // the pointer lifetime simple.
+    std::lock_guard<std::mutex> lock{mutex_};
+    if (refreshScheduler_ == nullptr) { return; }
+    refreshScheduler_->TriggerByIoFailure(status);
 }
 
 void KvClientImpl::StopRefresh()
 {
-    std::shared_ptr<RefreshScheduler> scheduler;
+    // Stop() joins the worker and must run without mutex_: the callback takes that lock.
+    std::unique_ptr<RefreshScheduler> scheduler;
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        scheduler = refreshScheduler_;
+        scheduler = std::move(refreshScheduler_);
     }
     if (scheduler != nullptr) { scheduler->Stop(); }
 }

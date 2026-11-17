@@ -48,8 +48,6 @@ namespace kv {
 using TransportFactory = std::function<std::unique_ptr<AsuTransport>()>;
 using TransProviderFactory =
     std::function<Status(const TransportConfig&, std::shared_ptr<TransProvider>&)>;
-// Creates the resident refresh scheduler; a null factory leaves refresh disabled.
-using RefreshSchedulerFactory = std::function<std::shared_ptr<RefreshScheduler>()>;
 
 std::unique_ptr<KvClient> CreateKvClient(TransportFactory transportFactory);
 std::unique_ptr<KvClient> CreateKvClient(TransportFactory transportFactory,
@@ -76,8 +74,7 @@ public:
     // Builds a client with the provided transport factory.
     explicit KvClientImpl(TransportFactory transportFactory,
                           ViewServerFactory viewServerFactory = nullptr,
-                          TransProviderFactory transProviderFactory = nullptr,
-                          RefreshSchedulerFactory refreshSchedulerFactory = nullptr);
+                          TransProviderFactory transProviderFactory = nullptr);
     // Shuts down the client during destruction.
     ~KvClientImpl() override;
 
@@ -215,8 +212,6 @@ private:
     TransProviderFactory transProviderFactory_;
     // Creates the external view server during Init.
     ViewServerFactory viewServerFactory_;
-    // Creates the refresh scheduler during Init; may be null.
-    RefreshSchedulerFactory refreshSchedulerFactory_;
     // mutex_ protects background refresh state and resource/view caches.
     mutable std::mutex mutex_;
     // memoryMu_ serializes provider creation with business-memory register/bind/unregister.
@@ -239,8 +234,8 @@ private:
     ViewSnapshotMap snapshots_;
     // Published view universe; namespaces and global epoch of the current snapshots.
     std::shared_ptr<ViewUniverse> viewUniverse_;
-    // Resident refresh scheduler; null disables refresh.
-    std::shared_ptr<RefreshScheduler> refreshScheduler_;
+    // Resident refresh scheduler; created by Init and stopped by Shutdown.
+    std::unique_ptr<RefreshScheduler> refreshScheduler_;
     // Long-lived transport pool.
     std::unordered_map<NodeId, std::shared_ptr<AsuTransport>> transportPool_;
     // Endpoints recorded when a pooled transport was created, for conflict detection.
