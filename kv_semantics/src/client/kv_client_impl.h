@@ -24,6 +24,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -35,6 +36,7 @@
 #include "kv_types.h"
 #include "spsc_ring_queue.h"
 #include "task/task_manager.h"
+#include "view/refresh_scheduler.h"
 #include "view/view_server.h"
 
 namespace kv {
@@ -46,6 +48,9 @@ namespace kv {
 using TransportFactory = std::function<std::unique_ptr<AsuTransport>()>;
 using TransProviderFactory =
     std::function<Status(const TransportConfig&, std::shared_ptr<TransProvider>&)>;
+// Creates the resident refresh scheduler; nullptr means the scheduler is unavailable
+// and the client falls back to its one-shot refresh thread.
+using RefreshSchedulerFactory = std::function<std::shared_ptr<RefreshScheduler>()>;
 
 std::unique_ptr<KvClient> CreateKvClient(TransportFactory transportFactory);
 std::unique_ptr<KvClient> CreateKvClient(TransportFactory transportFactory,
@@ -60,6 +65,10 @@ struct ViewSnapshot {
     std::unordered_map<NodeId, std::shared_ptr<AsuTransport>> transports;
 };
 
+using ViewSnapshotPtr = std::shared_ptr<ViewSnapshot>;
+// Published snapshots keyed by namespace.
+using ViewSnapshotMap = std::unordered_map<KvNsId, ViewSnapshotPtr>;
+
 class KvClientImpl;
 
 // KvClientImpl coordinates routing, transports, and aggregate task tracking.
@@ -68,7 +77,8 @@ public:
     // Builds a client with the provided transport factory.
     explicit KvClientImpl(TransportFactory transportFactory,
                           ViewServerFactory viewServerFactory = nullptr,
-                          TransProviderFactory transProviderFactory = nullptr);
+                          TransProviderFactory transProviderFactory = nullptr,
+                          RefreshSchedulerFactory refreshSchedulerFactory = nullptr);
     // Shuts down the client during destruction.
     ~KvClientImpl() override;
 
@@ -153,21 +163,37 @@ private:
     Status UnregisterProviderRegions(const std::shared_ptr<TransProvider>& transProvider,
                                      const std::vector<MRHandle>& handles);
     // Returns the current immutable snapshot of a namespace, or nullptr.
-    std::shared_ptr<ViewSnapshot> GetSnapshot(KvNsId nsId) const;
+    ViewSnapshotPtr GetSnapshot(KvNsId nsId) const;
     // Returns the published snapshot when exactly one namespace is published, else nullptr.
-    std::shared_ptr<ViewSnapshot> GetSingleSnapshot() const;
+    ViewSnapshotPtr GetSingleSnapshot() const;
     // Resolves the snapshot for a submission. Callers that pass kDefaultKvNsId have no
     // namespace of their own and resolve to the only published namespace.
     Status ResolveSnapshot(KvNsId nsId, std::shared_ptr<ViewSnapshot>& snapshot) const;
     // Returns any current snapshot; used by resource paths that are namespace agnostic.
     std::shared_ptr<ViewSnapshot> GetAnySnapshot() const;
 
-    // Refreshes the view and publishes it if it is newer.
-    Status RefreshView();
-    // Starts a non-blocking refresh after a status indicates stale routing or transport state.
-    void RequestBackgroundRefresh();
-    // Waits for the background refresh worker to finish.
-    void JoinBackgroundRefresh();
+    // Scheduler callback: fetch a candidate universe, validate it, build the changed
+    // namespace snapshots and publish everything atomically. Failures keep old state.
+    Status OnViewUniverseUpdated();
+    // Validates a candidate universe against the published global epoch.
+    Status ValidateCandidateUniverse(const ViewUniverse& candidate,
+                                     std::uint64_t publishedEpoch) const;
+    // Builds the next snapshot table for a candidate universe. Only namespaces whose view
+    // must be republished are rebuilt; the rest reuse the published snapshot.
+    Status BuildSnapshots(const ViewUniverse& candidate, ViewSnapshotMap& nextSnapshots);
+    // Publishes a validated candidate: universe first, then the snapshot table, in one
+    // critical section. Failures leave the published state untouched. The snapshot table
+    // is taken by rvalue reference: the caller hands it over and must not reuse it.
+    Status ApplyUniverse(const ViewUniverse& candidate, ViewSnapshotMap&& nextSnapshots,
+                         bool initial);
+    // Triggers a refresh through the injected scheduler. Without a scheduler the client
+    // does not refresh at all: there is no fallback driver.
+    void TriggerRefresh(const Status& status);
+    // Stops the scheduler and waits for a refresh in progress.
+    void StopRefresh();
+    // Refresh interval from configuration; defaults to 30 seconds, minimum 1 second.
+    // TODO: the default value is still to be agreed with the view provider owners.
+    static std::chrono::milliseconds GetRefreshInterval(const KvClientConfig& config);
 
     // Shuts down transports owned by a snapshot.
     Status ShutdownSnapshotTransports(const std::shared_ptr<ViewSnapshot>& snapshot);
@@ -195,14 +221,14 @@ private:
     TransProviderFactory transProviderFactory_;
     // Creates the external view server during Init.
     ViewServerFactory viewServerFactory_;
+    // Creates the refresh scheduler during Init; may be null.
+    RefreshSchedulerFactory refreshSchedulerFactory_;
     // mutex_ protects background refresh state and resource/view caches.
     mutable std::mutex mutex_;
     // memoryMu_ serializes provider creation with business-memory register/bind/unregister.
     std::mutex memoryMu_;
     // Tracks whether Init has published a usable snapshot.
     bool initialized_{false};
-    // Prevents duplicate background refresh workers.
-    bool refreshInProgress_{false};
     // Last accepted initialization config.
     KvClientConfig config_;
     // Source for dynamic global views; may be backed by viewServiceAddrs.
@@ -216,7 +242,11 @@ private:
     // Regions registered by the client and rebound to newly added providers.
     std::unordered_map<MRHandle, RegisteredMemory> registeredRegions_;
     // Current immutable routing and transport snapshots, keyed by namespace.
-    std::unordered_map<KvNsId, std::shared_ptr<ViewSnapshot>> snapshots_;
+    ViewSnapshotMap snapshots_;
+    // Published view universe; namespaces and global epoch of the current snapshots.
+    std::shared_ptr<ViewUniverse> viewUniverse_;
+    // Resident refresh scheduler; null means the fallback one-shot thread is used.
+    std::shared_ptr<RefreshScheduler> refreshScheduler_;
     // Transports removed from the active snapshot but still needed by old tasks.
     std::vector<std::shared_ptr<AsuTransport>> retiredTransports_;
     // Long-lived transport pool used by the multi-namespace (M800) view path.
@@ -227,8 +257,6 @@ private:
     std::mutex transportPoolMu_;
     // True when the view provider is M800; the pool path is only enabled then.
     bool transportPoolEnabled_{false};
-    // Worker used for non-blocking refresh requests.
-    std::thread refreshThread_;
 };
 
 }  // namespace kv

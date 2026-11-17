@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 #include "kv_metrics/metrics.h"
+#include "fake_refresh_scheduler.h"
 #include "router/router.h"
 #include "utils/config_utils.h"
 
@@ -861,7 +862,7 @@ TEST(KvClientImplTest, Provider_SharedModeReusesProviderForAddedTransport)
     },
         std::vector<std::uint64_t>{1, 2});
     auto client = std::make_unique<KvClientImpl>(
-        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state));
+        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state), MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     state->failFirstQuery = true;
@@ -1528,7 +1529,7 @@ TEST(KvClientImplTest, BackgroundRefresh_QueryRefreshesOnIoError)
     },
         std::vector<std::uint64_t>{1, 2});
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr, MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     QueryResult result;
@@ -1553,7 +1554,7 @@ TEST(KvClientImplTest, BackgroundRefresh_QueryRefreshesOnTimeout)
     },
         std::vector<std::uint64_t>{1, 2});
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr, MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     QueryResult result;
@@ -1600,7 +1601,7 @@ TEST(KvClientImplTest, BackgroundRefresh_LoadRecordsDispatchErrorWithoutRetry)
     },
         std::vector<std::uint64_t>{1, 2});
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr, MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     TaskId taskId = kInvalidTaskId;
@@ -1634,7 +1635,7 @@ TEST(KvClientImplTest, BackgroundRefresh_StoreRecordsDispatchErrorWithoutRetry)
     },
         std::vector<std::uint64_t>{1, 2});
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr, MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     TaskId taskId = kInvalidTaskId;
@@ -1668,7 +1669,7 @@ TEST(KvClientImplTest, BackgroundRefresh_DeleteRecordsDispatchErrorWithoutRetry)
     },
         std::vector<std::uint64_t>{1, 2});
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr, MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     TaskId taskId = kInvalidTaskId;
@@ -1717,7 +1718,7 @@ TEST(KvClientImplTest, SnapshotRefresh_BuildFailureKeepsOldSnapshot)
     auto viewServer = std::make_shared<FakeViewServer>(std::vector<std::vector<NodeId>>{{10}, {20}},
                                                        std::vector<std::uint64_t>{1, 2});
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr, MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     QueryResult result;
@@ -1762,7 +1763,7 @@ TEST(KvClientImplTest, MemoryRegister_NewIndependentProviderBindsRememberedRegio
     },
         std::vector<std::uint64_t>{1, 2});
     auto client = std::make_unique<KvClientImpl>(
-        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state));
+        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state), MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     std::vector<RegisteredMemory> results;
@@ -1825,7 +1826,7 @@ TEST(KvClientImplTest, MemoryRegister_RegisterFailureDoesNotBindProviders)
     },
         std::vector<std::uint64_t>{1, 2});
     auto client = std::make_unique<KvClientImpl>(
-        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state));
+        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state), MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     std::vector<RegisteredMemory> results;
@@ -1875,7 +1876,7 @@ TEST(KvClientImplTest, MemoryRegister_ProviderBindFailureDoesNotCacheResource)
     },
         std::vector<std::uint64_t>{1, 2});
     auto client = std::make_unique<KvClientImpl>(
-        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state));
+        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state), MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     std::vector<RegisteredMemory> results;
@@ -1937,7 +1938,7 @@ TEST(KvClientImplTest, MemoryRegister_UnregisterRemovesCachedResourceBeforeFutur
     },
         std::vector<std::uint64_t>{1, 2});
     auto client = std::make_unique<KvClientImpl>(
-        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state));
+        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state), MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     std::vector<RegisteredMemory> results;
@@ -2167,7 +2168,7 @@ TEST(KvClientImplTest, Task_CheckThenWaitHandlesRefreshableChildFailure)
     },
         std::vector<std::uint64_t>{1, 2});
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr, MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     TaskId taskId = 0;
@@ -2392,7 +2393,7 @@ TEST(KvClientImplTest, SnapshotRefresh_ReusesTransportAndBindsProviderForAddedAs
         {10, 20}
     });
     auto client = std::make_unique<KvClientImpl>(
-        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state));
+        MakeFactory(state), MakeViewServerFactory(viewServer), MakeProviderFactory(state), MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     std::vector<RegisteredMemory> results;
@@ -2443,7 +2444,8 @@ TEST(KvClientImplTest,
     },
         std::vector<std::uint64_t>{1, 2});
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr,
+                                MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(config).ok());
 
     TaskId taskId = 0;
@@ -2554,7 +2556,7 @@ TEST(KvClientImplTest, TransportPool_ReusesTransportAcrossViews)
         MakeEndpointView(2, {10, 20}),
     });
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr, MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(MakePooledConfig({10, 20})).ok());
     EXPECT_EQ(state->createdTransports, std::uint32_t{2});
 
@@ -2576,7 +2578,7 @@ TEST(KvClientImplTest, TransportPool_KeepsTransportWhenNodeLeavesView)
         MakeEndpointView(3, {10, 20}),
     });
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr, MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(MakePooledConfig({10, 20})).ok());
     EXPECT_EQ(state->createdTransports, std::uint32_t{2});
 
@@ -2603,7 +2605,7 @@ TEST(KvClientImplTest, TransportPool_FailsRefreshOnEndpointChange)
         MakeEndpointView(2, {10}, "10.0.0.2"),
     });
     auto client =
-        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer), nullptr, MakeAutoRefreshSchedulerFactory());
     ASSERT_TRUE(client->Init(MakePooledConfig({10})).ok());
     EXPECT_EQ(state->createdTransports, std::uint32_t{1});
 
@@ -2804,6 +2806,372 @@ TEST(KvClientImplTest, MultiNs_LegacyCallRejectedWhenMultipleNamespaces)
     const auto status = client->QueryAsync({MakeCacheKey("k05")}, taskId);
     EXPECT_EQ(status.code, StatusCode::INVALID_ARGUMENT);
     EXPECT_TRUE(state->queryCalls.empty());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+// Serves explicitly scripted universes: one entry per GetAllViews call.
+struct UniverseScript {
+    std::uint64_t globalEpoch{0};
+    std::unordered_map<KvNsId, GlobalView> views;
+};
+
+class ScriptedUniverseViewServer final : public ViewServer {
+public:
+    explicit ScriptedUniverseViewServer(std::vector<UniverseScript> scripts)
+        : scripts_(std::move(scripts))
+    {
+    }
+
+    Status GetGlobalView(GlobalView& view) override
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        const auto& current = scripts_[std::min(index_, scripts_.size() - 1)];
+        if (current.views.empty()) {
+            return Status::Error(StatusCode::NOT_FOUND, "no published view");
+        }
+        view = current.views.begin()->second;
+        return Status::OK();
+    }
+
+    Status GetAllViews(ViewUniverse& universe) override
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        const auto& current = scripts_[std::min(index_, scripts_.size() - 1)];
+        ++index_;
+        ViewUniverse next(current.views, current.globalEpoch);
+        return universe.ReplaceAll(next);
+    }
+
+    std::size_t FetchCount() const
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        return index_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::size_t index_{0};
+    std::vector<UniverseScript> scripts_;
+};
+
+// Drives refresh synchronously and records scheduler interactions.
+class FakeRefreshScheduler final : public RefreshScheduler {
+public:
+    Status Start(std::chrono::milliseconds interval, RefreshCallback callback) override
+    {
+        interval_ = interval;
+        callback_ = std::move(callback);
+        ++startCount_;
+        return startStatus_;
+    }
+
+    void Stop() override { ++stopCount_; }
+    void TriggerByTimer() override { ++timerTriggers_; }
+
+    void TriggerByIoFailure(const Status& status) override
+    {
+        ++ioFailureTriggers_;
+        lastIoFailure_ = status;
+    }
+
+    Status RefreshNow() override { return callback_ ? callback_() : Status::OK(); }
+    Status ManualRefresh() { return callback_ ? callback_() : Status::OK(); }
+
+    std::chrono::milliseconds interval_{0};
+    std::size_t startCount_{0};
+    std::size_t stopCount_{0};
+    std::size_t timerTriggers_{0};
+    std::size_t ioFailureTriggers_{0};
+    Status lastIoFailure_{Status::OK()};
+    Status startStatus_{Status::OK()};
+    RefreshCallback callback_;
+};
+
+std::unique_ptr<KvClientImpl> MakeClientWithScheduler(
+    const std::shared_ptr<TestState>& state, const std::shared_ptr<ViewServer>& viewServer,
+    const std::shared_ptr<FakeRefreshScheduler>& scheduler)
+{
+    auto factory = [scheduler] {
+        return std::static_pointer_cast<RefreshScheduler>(scheduler);
+    };
+    return std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer),
+                                          MakeProviderFactory(state), factory);
+}
+
+GlobalView MakeView(std::uint64_t viewEpoch, const std::vector<NodeId>& nodes)
+{
+    GlobalView view = MakeEndpointView(viewEpoch, nodes);
+    view.viewEpoch = viewEpoch;
+    return view;
+}
+
+UniverseScript MakeScript(std::uint64_t globalEpoch,
+                          std::unordered_map<KvNsId, GlobalView> views)
+{
+    UniverseScript script;
+    script.globalEpoch = globalEpoch;
+    script.views = std::move(views);
+    return script;
+}
+
+// ---------------------------------------------------------------- refresh pipeline
+
+TEST(KvClientImplTest, Refresh_StartsSchedulerWithConfiguredInterval)
+{
+    auto state = std::make_shared<TestState>();
+    auto scheduler = std::make_shared<FakeRefreshScheduler>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(
+        std::vector<UniverseScript>{MakeScript(1, {{100, MakeView(1, {10})}})});
+    auto client = MakeClientWithScheduler(state, viewServer, scheduler);
+    auto config = MakeConfig({10});
+    config.attrs["view.refresh_interval_ms"] = "5000";
+    ASSERT_TRUE(client->Init(config).ok());
+
+    EXPECT_EQ(scheduler->startCount_, std::size_t{1});
+    EXPECT_EQ(scheduler->interval_, std::chrono::milliseconds(5000));
+
+    ASSERT_TRUE(client->Shutdown().ok());
+    EXPECT_EQ(scheduler->stopCount_, std::size_t{1});
+}
+
+TEST(KvClientImplTest, Refresh_UsesDefaultIntervalWhenUnset)
+{
+    auto state = std::make_shared<TestState>();
+    auto scheduler = std::make_shared<FakeRefreshScheduler>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(
+        std::vector<UniverseScript>{MakeScript(1, {{100, MakeView(1, {10})}})});
+    auto client = MakeClientWithScheduler(state, viewServer, scheduler);
+    ASSERT_TRUE(client->Init(MakeConfig({10})).ok());
+
+    EXPECT_EQ(scheduler->interval_, std::chrono::milliseconds(30000));
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, Refresh_EqualEpochReplayIsNoOp)
+{
+    auto state = std::make_shared<TestState>();
+    auto scheduler = std::make_shared<FakeRefreshScheduler>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(std::vector<UniverseScript>{
+        MakeScript(1, {{100, MakeView(1, {10})}}),
+        MakeScript(1, {{100, MakeView(1, {10})}}),
+    });
+    auto client = MakeClientWithScheduler(state, viewServer, scheduler);
+    ASSERT_TRUE(client->Init(MakeConfig({10})).ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+
+    EXPECT_TRUE(scheduler->ManualRefresh().ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+
+    QueryResult result;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, Refresh_RejectsEmptyUniverse)
+{
+    auto state = std::make_shared<TestState>();
+    auto scheduler = std::make_shared<FakeRefreshScheduler>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(std::vector<UniverseScript>{
+        MakeScript(1, {{100, MakeView(1, {10})}}),
+        MakeScript(2, {}),
+    });
+    auto client = MakeClientWithScheduler(state, viewServer, scheduler);
+    ASSERT_TRUE(client->Init(MakeConfig({10})).ok());
+
+    // The view contract rejects an empty universe while it is replaced into the candidate.
+    EXPECT_EQ(scheduler->ManualRefresh().code, StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+
+    QueryResult result;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, Refresh_RejectsOlderGlobalEpoch)
+{
+    auto state = std::make_shared<TestState>();
+    auto scheduler = std::make_shared<FakeRefreshScheduler>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(std::vector<UniverseScript>{
+        MakeScript(5, {{100, MakeView(5, {10})}}),
+        MakeScript(4, {{100, MakeView(4, {10, 20})}}),
+    });
+    auto client = MakeClientWithScheduler(state, viewServer, scheduler);
+    ASSERT_TRUE(client->Init(MakeConfig({10, 20})).ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+
+    EXPECT_EQ(scheduler->ManualRefresh().code, StatusCode::INTERNAL_ERROR);
+    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+
+    QueryResult result;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, Refresh_RejectsInvalidNamespaceEpoch)
+{
+    auto state = std::make_shared<TestState>();
+    auto scheduler = std::make_shared<FakeRefreshScheduler>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(std::vector<UniverseScript>{
+        MakeScript(1, {{100, MakeView(1, {10})}}),
+        MakeScript(2, {{100, MakeView(5, {10, 20})}}),
+    });
+    auto client = MakeClientWithScheduler(state, viewServer, scheduler);
+    ASSERT_TRUE(client->Init(MakeConfig({10, 20})).ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+
+    // The view contract rejects a namespace whose viewEpoch exceeds globalEpoch.
+    EXPECT_EQ(scheduler->ManualRefresh().code, StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+
+    QueryResult result;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, Refresh_RebuildsChangedAndRemovedNamespacesOnly)
+{
+    auto state = std::make_shared<TestState>();
+    auto scheduler = std::make_shared<FakeRefreshScheduler>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(std::vector<UniverseScript>{
+        MakeScript(1,
+                   {
+                       {100, MakeView(1, {10})},
+                       {200, MakeView(1, {20})},
+        }),
+        MakeScript(2,
+                   {
+                       {100, MakeView(2, {10, 30})},
+        }),
+    });
+    auto client = MakeClientWithScheduler(state, viewServer, scheduler);
+    ASSERT_TRUE(client->Init(MakeConfig({10, 20, 30})).ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{2});
+
+    EXPECT_TRUE(scheduler->ManualRefresh().ok());
+
+    // Only the changed namespace 100 is rebuilt, and only for the new node 30.
+    EXPECT_EQ(state->createdTransports, std::uint32_t{3});
+    EXPECT_TRUE(state->shutdownCalls.empty());
+
+    TaskId taskId = kInvalidTaskId;
+    EXPECT_EQ(client->QueryAsync(KvNsId{200}, {MakeCacheKey("k05")}, taskId).code,
+              StatusCode::NOT_FOUND);
+
+    QueryResult result;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, Refresh_ReusesUnchangedNamespaceSnapshot)
+{
+    auto state = std::make_shared<TestState>();
+    auto scheduler = std::make_shared<FakeRefreshScheduler>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(std::vector<UniverseScript>{
+        MakeScript(1,
+                   {
+                       {100, MakeView(1, {10})},
+                       {200, MakeView(1, {20})},
+        }),
+        MakeScript(2,
+                   {
+                       {100, MakeView(2, {10, 30})},
+                       {200, MakeView(1, {20})},
+        }),
+    });
+    auto client = MakeClientWithScheduler(state, viewServer, scheduler);
+    ASSERT_TRUE(client->Init(MakeConfig({10, 20, 30})).ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{2});
+
+    EXPECT_TRUE(scheduler->ManualRefresh().ok());
+
+    // Namespace 200 kept its published snapshot, so node 20 was not rebuilt.
+    EXPECT_EQ(state->createdTransports, std::uint32_t{3});
+    TaskId taskId = kInvalidTaskId;
+    ASSERT_TRUE(client->QueryAsync(KvNsId{200}, {MakeCacheKey("k05")}, taskId).ok());
+    TaskResult taskResult;
+    EXPECT_TRUE(client->Wait(taskId, 1000, taskResult).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, Refresh_KeepsOldStateWhenBuildFails)
+{
+    auto state = std::make_shared<TestState>();
+    state->failInitNodes.insert(20);
+    auto scheduler = std::make_shared<FakeRefreshScheduler>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(std::vector<UniverseScript>{
+        MakeScript(1, {{100, MakeView(1, {10})}}),
+        MakeScript(2,
+                   {
+                       {100, MakeView(2, {10})},
+                       {200, MakeView(2, {20})},
+        }),
+    });
+    auto client = MakeClientWithScheduler(state, viewServer, scheduler);
+    ASSERT_TRUE(client->Init(MakeConfig({10, 20})).ok());
+
+    EXPECT_FALSE(scheduler->ManualRefresh().ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{2});
+
+    QueryResult result;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
+
+    state->failInitNodes.clear();
+    EXPECT_TRUE(scheduler->ManualRefresh().ok());
+    EXPECT_EQ(state->createdTransports, std::uint32_t{3});
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, Refresh_IoFailureGoesThroughScheduler)
+{
+    auto state = std::make_shared<TestState>();
+    state->failFirstQuery = true;
+    auto scheduler = std::make_shared<FakeRefreshScheduler>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(
+        std::vector<UniverseScript>{MakeScript(1, {{100, MakeView(1, {10})}})});
+    auto client = MakeClientWithScheduler(state, viewServer, scheduler);
+    ASSERT_TRUE(client->Init(MakeConfig({10})).ok());
+
+    QueryResult result;
+    EXPECT_EQ(QueryAndWait(*client, {MakeCacheKey("k05")}, result).code,
+              StatusCode::PARTIAL_FAILED);
+    EXPECT_GE(scheduler->ioFailureTriggers_, std::size_t{1});
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, Refresh_InFlightTaskKeepsOldSnapshot)
+{
+    auto state = std::make_shared<TestState>();
+    state->deferCompletionCallbacks = true;
+    auto scheduler = std::make_shared<FakeRefreshScheduler>();
+    auto viewServer = std::make_shared<ScriptedUniverseViewServer>(std::vector<UniverseScript>{
+        MakeScript(1, {{100, MakeView(1, {10})}}),
+        MakeScript(2, {{100, MakeView(2, {11})}}),
+    });
+    auto client = MakeClientWithScheduler(state, viewServer, scheduler);
+    ASSERT_TRUE(client->Init(MakeConfig({10, 11})).ok());
+
+    TaskId taskId = kInvalidTaskId;
+    ASSERT_TRUE(client->QueryAsync(KvNsId{100}, {MakeCacheKey("k05")}, taskId).ok());
+    ASSERT_TRUE(WaitForPendingCompletion(state, 10));
+
+    EXPECT_TRUE(scheduler->ManualRefresh().ok());
+
+    TaskResult completionResult;
+    completionResult.status = Status::OK();
+    completionResult.entryStatus.assign(1, Status::OK());
+    QueryResult completionQuery;
+    completionQuery.exists.assign(1, 0);
+    completionResult.queryResult = std::move(completionQuery);
+    ASSERT_TRUE(InvokePendingCompletion(state, 10, std::move(completionResult)));
+
+    TaskResult result;
+    EXPECT_TRUE(client->Wait(taskId, 1000, result).ok());
+
+    state->deferCompletionCallbacks = false;
+    QueryResult nextQuery;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, nextQuery).ok());
+    ASSERT_FALSE(state->queryCalls.empty());
+    EXPECT_EQ(state->queryCalls.back(), NodeId{11});
     ASSERT_TRUE(client->Shutdown().ok());
 }
 

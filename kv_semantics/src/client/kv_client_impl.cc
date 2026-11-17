@@ -115,10 +115,12 @@ void RecordSubmit(AsuOpType opType, std::size_t entryCount, const Status& status
 constexpr std::uint32_t kMaxShutdownDrainAttempts = 64;
 
 KvClientImpl::KvClientImpl(TransportFactory transportFactory, ViewServerFactory viewServerFactory,
-                           TransProviderFactory transProviderFactory)
+                           TransProviderFactory transProviderFactory,
+                           RefreshSchedulerFactory refreshSchedulerFactory)
     : transportFactory_(std::move(transportFactory)),
       transProviderFactory_(std::move(transProviderFactory)),
-      viewServerFactory_(std::move(viewServerFactory))
+      viewServerFactory_(std::move(viewServerFactory)),
+      refreshSchedulerFactory_(std::move(refreshSchedulerFactory))
 {
     if (!transportFactory_) { transportFactory_ = CreateAsuTransport; }
     if (!transProviderFactory_) { transProviderFactory_ = CreateTransProvider; }
@@ -174,15 +176,11 @@ Status KvClientImpl::Init(const KvClientConfig& config)
         providerMemoryStates_.push_back({memoryProvider_, {}});
     }
 
-    std::unordered_map<KvNsId, std::shared_ptr<ViewSnapshot>> nextSnapshots;
-    for (auto nsId : universe.GetAllNsIds()) {
-        GlobalView view;
-        status = universe.GetView(nsId, view);
-        if (!status.ok()) { break; }
-        std::shared_ptr<ViewSnapshot> nextSnapshot;
-        status = BuildSnapshot(nsId, view, nullptr, nextSnapshot);
-        if (!status.ok()) { break; }
-        nextSnapshots.emplace(nsId, std::move(nextSnapshot));
+    viewUniverse_ = std::make_shared<ViewUniverse>();
+    ViewSnapshotMap initialSnapshots;
+    status = BuildSnapshots(universe, initialSnapshots);
+    if (status.ok()) {
+        status = ApplyUniverse(universe, std::move(initialSnapshots), true);
     }
     if (!status.ok()) {
         (void)CloseTransportPool();
@@ -191,6 +189,7 @@ Status KvClientImpl::Init(const KvClientConfig& config)
             providerMemoryStates_.clear();
             memoryProvider_.reset();
         }
+        viewUniverse_.reset();
         transportPoolEnabled_ = false;
         return status;
     }
@@ -198,8 +197,22 @@ Status KvClientImpl::Init(const KvClientConfig& config)
     taskQueue_.Setup(queueDepth + 1);
     stopWorker_.store(false, std::memory_order_release);
     worker_ = std::thread(&KvClientImpl::WorkerLoop, this);
-    snapshots_ = std::move(nextSnapshots);
     initialized_ = true;
+
+    if (refreshSchedulerFactory_) {
+        refreshScheduler_ = refreshSchedulerFactory_();
+    }
+    if (refreshScheduler_) {
+        const auto interval = GetRefreshInterval(config);
+        const auto startStatus =
+            refreshScheduler_->Start(interval, [this] { return OnViewUniverseUpdated(); });
+        if (!startStatus.ok()) {
+            KV_WARN("Refresh scheduler start failed, falling back to one-shot refresh: "
+                    "code={} message={}",
+                    static_cast<int>(startStatus.code), startStatus.message);
+            refreshScheduler_.reset();
+        }
+    }
     return Status::OK();
 }
 
@@ -216,16 +229,18 @@ Status KvClientImpl::Shutdown()
         stopWorker_.store(true, std::memory_order_release);
     }
     workerCv_.notify_one();
-    JoinBackgroundRefresh();
+    StopRefresh();
     if (worker_.joinable()) { worker_.join(); }
 
-    std::unordered_map<KvNsId, std::shared_ptr<ViewSnapshot>> snapshots;
+    ViewSnapshotMap snapshots;
     std::vector<std::shared_ptr<AsuTransport>> retiredTransports;
     std::vector<ProviderMemoryState> providerMemoryStates;
     {
         std::lock_guard<std::mutex> lock{mutex_};
         snapshots = std::move(snapshots_);
         retiredTransports = std::move(retiredTransports_);
+        viewUniverse_.reset();
+        refreshScheduler_.reset();
         config_ = KvClientConfig{};
         viewServer_.reset();
         transportConfigs_.clear();
@@ -280,7 +295,7 @@ Status KvClientImpl::QueryAsync(KvNsId nsId, const std::vector<CacheKey>& keys, 
 {
     auto status = SubmitAsync(AsuOpType::QUERY, nsId, keys, taskId);
     RecordSubmit(AsuOpType::QUERY, keys.size(), status);
-    if (IsRefreshNeeded(status)) { RequestBackgroundRefresh(); }
+    if (IsRefreshNeeded(status)) { TriggerRefresh(status); }
     return status;
 }
 
@@ -345,7 +360,7 @@ Status KvClientImpl::Wait(TaskId taskId, std::uint64_t timeoutMs, TaskResult& re
     if (status.code == StatusCode::TASK_NOT_FOUND) { return status; }
     if (viewServer_ != nullptr &&
         (viewServer_->ShouldRefreshView(status) || viewServer_->ShouldRefreshView(result))) {
-        RequestBackgroundRefresh();
+        TriggerRefresh(status.ok() ? result.status : status);
     }
     return status;
 }
@@ -355,7 +370,10 @@ Status KvClientImpl::RegisterRegions(const std::vector<MemoryRegion>& regions,
 {
     bool needRefresh = false;
     auto status = RegisterRegionsOnce(regions, registeredRegions, needRefresh);
-    if (needRefresh) { RequestBackgroundRefresh(); }
+    if (needRefresh) {
+        TriggerRefresh(Status::Error(StatusCode::NOT_FOUND,
+                                     "registered memory requires a refreshed view"));
+    }
     return status;
 }
 
@@ -629,7 +647,7 @@ void KvClientImpl::WorkerLoop()
         } else {
             ClientTaskManager::CompleteWithError(ctx, status);
         }
-        if (IsRefreshNeeded(status)) { RequestBackgroundRefresh(); }
+        if (IsRefreshNeeded(status)) { TriggerRefresh(status); }
     };
     taskQueue_.ConsumerLoop(stopWorker_, producerMu_, workerCv_, processTask);
 
@@ -963,108 +981,197 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
     return failure;
 }
 
-Status KvClientImpl::RefreshView()
+Status KvClientImpl::ValidateCandidateUniverse(const ViewUniverse& candidate,
+                                               std::uint64_t publishedEpoch) const
 {
-    std::shared_ptr<ViewServer> viewServer;
-    std::unordered_map<KvNsId, std::shared_ptr<ViewSnapshot>> oldSnapshots;
+    if (candidate.Empty()) {
+        return Status::Error(StatusCode::NOT_INITIALIZED, "candidate view has no namespace");
+    }
+
+    const auto candidateEpoch = candidate.GetGlobalEpoch();
+    if (candidateEpoch < publishedEpoch) {
+        return Status::Error(StatusCode::INTERNAL_ERROR,
+                             "candidate globalEpoch is older: candidate=" +
+                                 std::to_string(candidateEpoch) +
+                                 " published=" + std::to_string(publishedEpoch));
+    }
+
+    for (auto nsId : candidate.GetAllNsIds()) {
+        GlobalView view;
+        auto status = candidate.GetView(nsId, view);
+        if (!status.ok()) { return WithContext(status, "nsId=" + std::to_string(nsId)); }
+        if (GetSortedAsuIds(view).empty()) {
+            return Status::Error(StatusCode::INTERNAL_ERROR,
+                                 "candidate namespace has no routable ASU, nsId=" +
+                                     std::to_string(nsId));
+        }
+        if (view.viewEpoch > candidateEpoch) {
+            return Status::Error(StatusCode::INTERNAL_ERROR,
+                                 "namespace viewEpoch exceeds globalEpoch, nsId=" +
+                                     std::to_string(nsId) + " viewEpoch=" +
+                                     std::to_string(view.viewEpoch) + " globalEpoch=" +
+                                     std::to_string(candidateEpoch));
+        }
+    }
+    return Status::OK();
+}
+
+Status KvClientImpl::BuildSnapshots(const ViewUniverse& candidate,
+                                    ViewSnapshotMap& nextSnapshots)
+{
+    // The published table is only read for reuse; the refresh thread is the only writer.
+    ViewSnapshotMap published;
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        if (!initialized_ && !refreshInProgress_) { return NotInitialized(); }
+        published = snapshots_;
+    }
+
+    for (auto nsId : candidate.GetAllNsIds()) {
+        GlobalView view;
+        auto status = candidate.GetView(nsId, view);
+        if (!status.ok()) { return WithContext(status, "nsId=" + std::to_string(nsId)); }
+
+        ViewSnapshotPtr publishedSnapshot;
+        auto publishedIter = published.find(nsId);
+        if (publishedIter != published.end()) { publishedSnapshot = publishedIter->second; }
+
+        if (publishedSnapshot != nullptr && viewServer_ != nullptr &&
+            !viewServer_->ShouldPublishView(publishedSnapshot->view, view)) {
+            // Same or older epoch: the published snapshot of this namespace is kept.
+            nextSnapshots.emplace(nsId, publishedSnapshot);
+            continue;
+        }
+
+        ViewSnapshotPtr nextSnapshot;
+        status = BuildSnapshot(nsId, view, publishedSnapshot, nextSnapshot);
+        if (!status.ok()) { return WithContext(status, "nsId=" + std::to_string(nsId)); }
+        nextSnapshots.emplace(nsId, std::move(nextSnapshot));
+    }
+    return Status::OK();
+}
+
+Status KvClientImpl::ApplyUniverse(const ViewUniverse& candidate,
+                                   ViewSnapshotMap&& nextSnapshots, bool initial)
+{
+    std::lock_guard<std::mutex> lock{mutex_};
+    if (viewUniverse_ == nullptr) { viewUniverse_ = std::make_shared<ViewUniverse>(); }
+
+    auto status = initial ? viewUniverse_->ReplaceAll(candidate)
+                          : viewUniverse_->PublishAll(candidate);
+    if (!status.ok()) { return status; }
+
+    if (!transportPoolEnabled_) {
+        // Legacy path: transports that are no longer referenced are retired and closed
+        // after the shutdown drain, never in the middle of an IO.
+        for (const auto& item : snapshots_) {
+            if (!item.second) { continue; }
+            auto nextIter = nextSnapshots.find(item.first);
+            const bool hasNext = nextIter != nextSnapshots.end() && nextIter->second != nullptr;
+            for (const auto& transport : item.second->transports) {
+                if (hasNext && nextIter->second->transports.find(transport.first) !=
+                                   nextIter->second->transports.end()) {
+                    continue;
+                }
+                retiredTransports_.emplace_back(transport.second);
+            }
+        }
+    }
+
+    snapshots_ = std::move(nextSnapshots);
+    return Status::OK();
+}
+
+Status KvClientImpl::OnViewUniverseUpdated()
+{
+    std::shared_ptr<ViewServer> viewServer;
+    std::shared_ptr<ViewUniverse> published;
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (!initialized_) { return NotInitialized(); }
         viewServer = viewServer_;
-        oldSnapshots = snapshots_;
+        published = viewUniverse_;
     }
     if (viewServer == nullptr) {
         return Status::Error(StatusCode::NOT_INITIALIZED, "view server is not initialized");
     }
 
-    ViewUniverse universe;
-    auto status = viewServer->GetAllViews(universe);
+    ViewUniverse candidate;
+    auto status = viewServer->GetAllViews(candidate);
     if (!status.ok()) { return status; }
-    if (universe.Empty()) {
-        return Status::Error(StatusCode::NOT_INITIALIZED, "view server returned no namespace view");
-    }
 
-    std::unordered_map<KvNsId, std::shared_ptr<ViewSnapshot>> nextSnapshots;
-    bool changed = false;
-    for (auto nsId : universe.GetAllNsIds()) {
-        GlobalView view;
-        status = universe.GetView(nsId, view);
-        if (!status.ok()) { return status; }
+    const auto publishedEpoch = published == nullptr ? 0 : published->GetGlobalEpoch();
+    status = ValidateCandidateUniverse(candidate, publishedEpoch);
+    if (!status.ok()) { return status; }
 
-        auto oldIter = oldSnapshots.find(nsId);
-        const std::shared_ptr<ViewSnapshot> oldSnapshot =
-            oldIter == oldSnapshots.end() ? nullptr : oldIter->second;
-        if (oldSnapshot != nullptr && !viewServer->ShouldPublishView(oldSnapshot->view, view)) {
-            // Same or older epoch: the published snapshot of this namespace is kept.
-            nextSnapshots.emplace(nsId, oldSnapshot);
-            continue;
+    if (published != nullptr && candidate.GetGlobalEpoch() == publishedEpoch) {
+        // The contract treats an equal epoch as "nothing changed". A different namespace
+        // set at the same epoch is inconsistent and must be rejected instead of applied.
+        auto publishedNs = published->GetAllNsIds();
+        auto candidateNs = candidate.GetAllNsIds();
+        std::sort(publishedNs.begin(), publishedNs.end());
+        std::sort(candidateNs.begin(), candidateNs.end());
+        if (publishedNs != candidateNs) {
+            return Status::Error(StatusCode::INTERNAL_ERROR,
+                                 "namespace set changed without a globalEpoch advance");
         }
-
-        std::shared_ptr<ViewSnapshot> nextSnapshot;
-        status = BuildSnapshot(nsId, view, oldSnapshot, nextSnapshot);
-        if (!status.ok()) { return status; }
-        nextSnapshots.emplace(nsId, std::move(nextSnapshot));
-        changed = true;
+        return Status::OK();
     }
 
-    if (!changed && nextSnapshots.size() == oldSnapshots.size()) { return Status::OK(); }
+    ViewSnapshotMap nextSnapshots;
+    status = BuildSnapshots(candidate, nextSnapshots);
+    if (!status.ok()) { return status; }
 
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        if (!initialized_ && !refreshInProgress_) { return NotInitialized(); }
-        if (!transportPoolEnabled_) {
-            // Legacy path: transports that are no longer referenced are retired and closed
-            // after the shutdown drain, never in the middle of an IO.
-            for (const auto& item : oldSnapshots) {
-                if (!item.second) { continue; }
-                auto nextIter = nextSnapshots.find(item.first);
-                const bool hasNext =
-                    nextIter != nextSnapshots.end() && nextIter->second != nullptr;
-                for (const auto& transport : item.second->transports) {
-                    if (hasNext && nextIter->second->transports.find(transport.first) !=
-                                       nextIter->second->transports.end()) {
-                        continue;
-                    }
-                    retiredTransports_.emplace_back(transport.second);
-                }
-            }
-        }
-        snapshots_ = std::move(nextSnapshots);
+        if (!initialized_) { return NotInitialized(); }
     }
-
-    return Status::OK();
+    // A newer global epoch is always published, even when no namespace snapshot changed:
+    // publishing advances the baseline so the next refresh is not a no-op fetch.
+    return ApplyUniverse(candidate, std::move(nextSnapshots), false);
 }
 
-void KvClientImpl::RequestBackgroundRefresh()
+std::chrono::milliseconds KvClientImpl::GetRefreshInterval(const KvClientConfig& config)
 {
-    std::thread completedThread;
-    {
-        std::lock_guard<std::mutex> lock{mutex_};
-        if (!initialized_ || refreshInProgress_) { return; }
-        completedThread = std::move(refreshThread_);
-        refreshInProgress_ = true;
-        refreshThread_ = std::thread([this] {
-            const auto status = RefreshView();
-            if (!status.ok()) {
-                KV_WARN("Background view refresh failed: code={} message={}",
-                        static_cast<int>(status.code), status.message);
-            }
-            std::lock_guard<std::mutex> lock{mutex_};
-            refreshInProgress_ = false;
-        });
+    // TODO: the default interval and the minimum are placeholders. Agree the production
+    // value with the view/agent owners (and decide whether it should track the agent
+    // refresh period) before enabling this on real deployments.
+    constexpr std::uint64_t kDefaultIntervalMs = 30000;
+    constexpr std::uint64_t kMinIntervalMs = 1000;
+    std::uint64_t intervalMs = kDefaultIntervalMs;
+    auto iter = config.attrs.find("view.refresh_interval_ms");
+    if (iter != config.attrs.end()) {
+        try {
+            intervalMs = std::stoull(iter->second);
+        } catch (const std::exception&) {
+            intervalMs = kDefaultIntervalMs;
+        }
     }
-
-    if (completedThread.joinable()) { completedThread.join(); }
+    if (intervalMs < kMinIntervalMs) { intervalMs = kMinIntervalMs; }
+    return std::chrono::milliseconds(intervalMs);
 }
 
-void KvClientImpl::JoinBackgroundRefresh()
+void KvClientImpl::TriggerRefresh(const Status& status)
 {
-    std::thread refreshThread;
+    std::shared_ptr<RefreshScheduler> scheduler;
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        refreshThread = std::move(refreshThread_);
+        scheduler = refreshScheduler_;
     }
-    if (refreshThread.joinable()) { refreshThread.join(); }
+    if (scheduler == nullptr) {
+        // No scheduler injected means no refresh: the scheduler is the only driver.
+        return;
+    }
+    scheduler->TriggerByIoFailure(status);
+}
+
+void KvClientImpl::StopRefresh()
+{
+    std::shared_ptr<RefreshScheduler> scheduler;
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        scheduler = refreshScheduler_;
+    }
+    if (scheduler != nullptr) { scheduler->Stop(); }
 }
 
 Status KvClientImpl::ShutdownSnapshotTransports(const std::shared_ptr<ViewSnapshot>& snapshot)
