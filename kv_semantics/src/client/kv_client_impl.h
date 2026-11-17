@@ -48,8 +48,7 @@ namespace kv {
 using TransportFactory = std::function<std::unique_ptr<AsuTransport>()>;
 using TransProviderFactory =
     std::function<Status(const TransportConfig&, std::shared_ptr<TransProvider>&)>;
-// Creates the resident refresh scheduler; nullptr means the scheduler is unavailable
-// and the client falls back to its one-shot refresh thread.
+// Creates the resident refresh scheduler; a null factory leaves refresh disabled.
 using RefreshSchedulerFactory = std::function<std::shared_ptr<RefreshScheduler>()>;
 
 std::unique_ptr<KvClient> CreateKvClient(TransportFactory transportFactory);
@@ -139,13 +138,10 @@ private:
     // Performs one register operation on the current snapshot.
     Status RegisterRegionsOnce(const std::vector<MemoryRegion>& regions,
                                std::vector<RegisteredMemory>& registeredRegions, bool& needRefresh);
-    // Builds a complete immutable snapshot for one namespace view.
+    // Builds a complete immutable snapshot for one namespace view. Transports always come
+    // from the global transport pool.
     Status BuildSnapshot(KvNsId nsId, const GlobalView& view,
-                         const std::shared_ptr<ViewSnapshot>& oldSnapshot,
                          std::shared_ptr<ViewSnapshot>& snapshot);
-    // Creates and initializes a transport for one ASU.
-    Status BuildTransport(NodeId nodeId, const NodeInfo& asuInfo,
-                          std::shared_ptr<AsuTransport>& transport);
     // Creates and initializes a transport from a ready transport config.
     Status CreateTransportForNode(const TransportConfig& config,
                                   std::shared_ptr<AsuTransport>& transport);
@@ -173,7 +169,8 @@ private:
     std::shared_ptr<ViewSnapshot> GetAnySnapshot() const;
 
     // Scheduler callback: fetch a candidate universe, validate it, build the changed
-    // namespace snapshots and publish everything atomically. Failures keep old state.
+    // namespace snapshots and publish everything atomically. A failed refresh leaves the
+    // published state unchanged.
     Status OnViewUniverseUpdated();
     // Validates a candidate universe against the published global epoch.
     Status ValidateCandidateUniverse(const ViewUniverse& candidate,
@@ -187,16 +184,13 @@ private:
     Status ApplyUniverse(const ViewUniverse& candidate, ViewSnapshotMap&& nextSnapshots,
                          bool initial);
     // Triggers a refresh through the injected scheduler. Without a scheduler the client
-    // does not refresh at all: there is no fallback driver.
+    // performs no refresh.
     void TriggerRefresh(const Status& status);
     // Stops the scheduler and waits for a refresh in progress.
     void StopRefresh();
     // Refresh interval from configuration; defaults to 30 seconds, minimum 1 second.
-    // TODO: the default value is still to be agreed with the view provider owners.
+    // TODO: agree the default value with the view provider owners.
     static std::chrono::milliseconds GetRefreshInterval(const KvClientConfig& config);
-
-    // Shuts down transports owned by a snapshot.
-    Status ShutdownSnapshotTransports(const std::shared_ptr<ViewSnapshot>& snapshot);
 
     // Returns whether a status suggests the published snapshot should be refreshed.
     bool IsRefreshNeeded(const Status& status) const;
@@ -245,18 +239,14 @@ private:
     ViewSnapshotMap snapshots_;
     // Published view universe; namespaces and global epoch of the current snapshots.
     std::shared_ptr<ViewUniverse> viewUniverse_;
-    // Resident refresh scheduler; null means the fallback one-shot thread is used.
+    // Resident refresh scheduler; null disables refresh.
     std::shared_ptr<RefreshScheduler> refreshScheduler_;
-    // Transports removed from the active snapshot but still needed by old tasks.
-    std::vector<std::shared_ptr<AsuTransport>> retiredTransports_;
-    // Long-lived transport pool used by the multi-namespace (M800) view path.
+    // Long-lived transport pool.
     std::unordered_map<NodeId, std::shared_ptr<AsuTransport>> transportPool_;
     // Endpoints recorded when a pooled transport was created, for conflict detection.
     std::unordered_map<NodeId, std::vector<NodeEndpoint>> transportEndpoints_;
     // Protects transportPool_ and transportEndpoints_.
     std::mutex transportPoolMu_;
-    // True when the view provider is M800; the pool path is only enabled then.
-    bool transportPoolEnabled_{false};
 };
 
 }  // namespace kv

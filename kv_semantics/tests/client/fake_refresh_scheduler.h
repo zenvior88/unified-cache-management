@@ -13,8 +13,9 @@
 
 namespace kv::test {
 
-// Runs the refresh callback synchronously on every trigger. Tests inject this scheduler
-// through the client factory so refresh no longer needs a fallback thread.
+// Runs the refresh callback synchronously on every trigger, coalescing concurrent
+// triggers like the resident scheduler. Tests inject it through the client factory so
+// they control when a refresh happens.
 class AutoRefreshScheduler final : public RefreshScheduler {
 public:
     Status Start(std::chrono::milliseconds interval, RefreshCallback callback) override

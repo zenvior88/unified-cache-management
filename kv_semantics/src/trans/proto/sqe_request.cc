@@ -172,7 +172,6 @@ KvBatchStoreRequest BuildBatchStoreRequest(
 {
     KvBatchStoreRequest request;
     request.cid = cid;
-    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
     request.dtype = GetTransportConfigAttr<std::uint8_t>(attrs, "dtype");
     request.dspec = GetTransportConfigAttr<std::uint8_t>(attrs, "dspec");
     request.response_buffer_addr = flagBuffer.device_addr;
@@ -199,7 +198,6 @@ KvStoreRequest BuildStoreRequest(const KVBuffer& entry,
 {
     KvStoreRequest request;
     request.cid = cid;
-    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
     request.dtype = GetTransportConfigAttr<std::uint8_t>(attrs, "dtype");
     request.dspec = GetTransportConfigAttr<std::uint8_t>(attrs, "dspec");
     request.buffer_addr = entry.buffer.region.addr;
@@ -218,7 +216,6 @@ KvRetrieveRequest BuildRetrieveRequest(const KVBuffer& entry,
 {
     KvRetrieveRequest request;
     request.cid = cid;
-    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
     request.buffer_addr = entry.buffer.region.addr;
     request.buffer_length = static_cast<std::uint32_t>(entry.buffer.region.size);
     request.mr_key = *entry.mrKey;
@@ -235,7 +232,6 @@ KvBatchRetrieveRequest BuildBatchRetrieveRequest(
 {
     KvBatchRetrieveRequest request;
     request.cid = cid;
-    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
     request.response_buffer_addr = flagBuffer.device_addr;
     request.response_mr_key = flagBuffer.tokenId;
     request.lr = GetTransportConfigAttr<bool>(attrs, "lr");
@@ -270,7 +266,6 @@ KvDeleteRequest BuildDeleteRequest(const BatchView<CacheKey>& keys,
 {
     KvDeleteRequest request;
     request.cid = cid;
-    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
     request.response_buffer_addr = flagBuffer.device_addr;
     request.response_mr_key = flagBuffer.tokenId;
     request.rflag = true;
@@ -285,7 +280,6 @@ KvExistRequest BuildExistRequest(const BatchView<CacheKey>& keys,
 {
     KvExistRequest request;
     request.cid = cid;
-    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
     request.response_buffer_addr = flagBuffer.device_addr;
     request.response_mr_key = flagBuffer.tokenId;
     request.rflag = true;

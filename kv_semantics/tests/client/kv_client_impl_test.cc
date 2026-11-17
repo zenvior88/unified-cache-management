@@ -1332,8 +1332,10 @@ TEST(KvClientImplTest, Routing_UsesRouterConfigFromClientConfigAttrs)
     EXPECT_EQ(state->storeCalls, std::vector<NodeId>({10}));
 }
 
-TEST(KvClientImplTest, ViewServer_InitFailsWhenViewReferencesMissingTransportConfig)
+TEST(KvClientImplTest, ViewServer_InitClonesTemplateConfigForUnconfiguredNode)
 {
+    // The pool serves every node of a view: a node without an exact transport config is
+    // configured from the first template entry instead of failing the initialization.
     auto state = std::make_shared<TestState>();
     auto config = MakeConfig({10});
     auto viewServer = std::make_shared<FakeViewServer>(
@@ -1346,8 +1348,12 @@ TEST(KvClientImplTest, ViewServer_InitFailsWhenViewReferencesMissingTransportCon
 
     auto status = client->Init(config);
 
-    EXPECT_EQ(status.code, StatusCode::NOT_FOUND);
-    EXPECT_NE(status.message.find("nodeId=20"), std::string::npos);
+    ASSERT_TRUE(status.ok()) << status.message;
+    EXPECT_EQ(state->createdTransports, std::uint32_t{2});
+
+    QueryResult result;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
 }
 
 TEST(KvClientImplTest, Query_PerKeyKeepsOriginalOrder)
@@ -1714,6 +1720,8 @@ TEST(KvClientImplTest, SnapshotRefresh_BuildFailureKeepsOldSnapshot)
 {
     auto state = std::make_shared<TestState>();
     state->failFirstQuery = true;
+    // The refreshed view only contains node 20, whose transport cannot be created.
+    state->failInitNodes.insert(20);
     auto config = MakeConfig({10});
     auto viewServer = std::make_shared<FakeViewServer>(std::vector<std::vector<NodeId>>{{10}, {20}},
                                                        std::vector<std::uint64_t>{1, 2});
@@ -1729,7 +1737,8 @@ TEST(KvClientImplTest, SnapshotRefresh_BuildFailureKeepsOldSnapshot)
     status = QueryAndWait(*client, {MakeCacheKey("k05")}, result);
 
     EXPECT_TRUE(status.ok()) << status.message;
-    EXPECT_EQ(state->createdTransports, std::uint32_t{1});
+    // Node 20 failed to build; the published snapshot with node 10 still serves IO.
+    EXPECT_EQ(state->createdTransports, std::uint32_t{2});
     EXPECT_EQ(state->queryCalls, std::vector<NodeId>({10}));
 }
 
@@ -2726,7 +2735,7 @@ TEST(KvClientImplTest, MultiNs_UnknownNsReturnsNotFound)
     ASSERT_TRUE(client->Shutdown().ok());
 }
 
-TEST(KvClientImplTest, MultiNs_LegacyDefaultNsUnchanged)
+TEST(KvClientImplTest, MultiNs_DefaultNsUnchanged)
 {
     auto state = std::make_shared<TestState>();
     auto client = CreateKvClient(MakeFactory(state));
@@ -2770,7 +2779,7 @@ TEST(KvClientImplTest, MultiNs_SharedTransportServesMultipleNs)
     ASSERT_TRUE(client->Shutdown().ok());
 }
 
-TEST(KvClientImplTest, MultiNs_SinglePoolNamespaceUsesPublishedNsOnLegacyCalls)
+TEST(KvClientImplTest, MultiNs_NsLessCallUsesPublishedNs)
 {
     auto state = std::make_shared<TestState>();
     const KvNsId nsId{1009323};
@@ -2790,7 +2799,7 @@ TEST(KvClientImplTest, MultiNs_SinglePoolNamespaceUsesPublishedNsOnLegacyCalls)
     ASSERT_TRUE(client->Shutdown().ok());
 }
 
-TEST(KvClientImplTest, MultiNs_LegacyCallRejectedWhenMultipleNamespaces)
+TEST(KvClientImplTest, MultiNs_NsLessCallRejectedWhenMultipleNamespaces)
 {
     auto state = std::make_shared<TestState>();
     std::unordered_map<KvNsId, GlobalView> views;
