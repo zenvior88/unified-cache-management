@@ -115,6 +115,9 @@ public:
     Status UnregisterRegions(const std::vector<MRHandle>& handles) override;
 
 private:
+    // Rolls a partially initialized client back to the pre-Init state.
+    Status FailInit(Status status);
+
     struct ProviderMemoryState {
         std::shared_ptr<TransProvider> provider;
         std::unordered_map<MRHandle, MRHandle> regionHandles;

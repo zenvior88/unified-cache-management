@@ -273,10 +273,16 @@ void ClientTaskManager::Finalize(const ClientTaskPtr& task)
             itemCount, static_cast<int>(transportTask->finalStatus.code),
             transportTask->finalStatus.message);
     }
-    task->finalStatus =
-        failedTransportTasks == 0 && task->routingFailedEntries == 0
-            ? Status::OK()
-            : Status::Error(StatusCode::PARTIAL_FAILED, "client task partially failed");
+    if (failedTransportTasks == 0 && task->routingFailedEntries == 0) {
+        task->finalStatus = Status::OK();
+    } else if (failedTransportTasks == 0 && task->entryStatus.size() != 0 &&
+               task->routingFailedEntries == task->entryStatus.size()) {
+        // Nothing was routable: report the routing failure itself instead of a partial one.
+        task->finalStatus = Status::Error(StatusCode::NO_AVAILABLE_NODE,
+                                          "no available node for any entry");
+    } else {
+        task->finalStatus = Status::Error(StatusCode::PARTIAL_FAILED, "client task partially failed");
+    }
     RecordClientTaskCompletion(*task);
     if (task->finalStatus.ok()) {
         KV_DEBUG("ASU client task completed: client_task_id={} op={} transport_tasks={}.",

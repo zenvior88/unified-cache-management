@@ -121,36 +121,44 @@ Status KvClientImpl::Init(const KvClientConfig& config)
         config.sharedProviderMode != SharedProviderMode::SHARED) {
         return Status::Error(StatusCode::INVALID_ARGUMENT, "sharedProviderMode must be 0 or 1");
     }
-
-    config_ = config;
-    viewServer_ = viewServerFactory_(config);
-    if (viewServer_ == nullptr) {
-        return Status::Error(StatusCode::NOT_INITIALIZED, "view server factory returned null");
-    }
-    transportConfigs_.clear();
-    for (const auto& transportConfig : config.transportConfigs) {
-        transportConfigs_[transportConfig.nodeId] = transportConfig;
-    }
+    // Validate the config before touching any state, so an invalid config leaves nothing
+    // to roll back.
     if (config.transportConfigs.empty()) {
         return Status::Error(StatusCode::INVALID_ARGUMENT,
                              "at least one transport config is required");
     }
+
+    config_ = config;
+    transportConfigs_.clear();
+    for (const auto& transportConfig : config.transportConfigs) {
+        transportConfigs_[transportConfig.nodeId] = transportConfig;
+    }
+
+    viewServer_ = viewServerFactory_(config);
+    if (viewServer_ == nullptr) {
+        return FailInit(Status::Error(StatusCode::NOT_INITIALIZED,
+                                          "view server factory returned null"));
+    }
+
     const auto queueDepth =
         std::max<std::size_t>(2, static_cast<std::size_t>(config.maxInflightTasks));
 
     ViewUniverse universe;
     auto status = viewServer_->GetAllViews(universe);
-    if (!status.ok()) { return status; }
+    if (!status.ok()) { return FailInit(status); }
     if (universe.Empty()) {
-        return Status::Error(StatusCode::NOT_INITIALIZED, "view server returned no namespace view");
+        return FailInit(Status::Error(StatusCode::NOT_INITIALIZED,
+                                          "view server returned no namespace view"));
     }
 
     std::shared_ptr<TransProvider> memoryProvider;
     status = transProviderFactory_(config.transportConfigs.front(), memoryProvider);
-    if (!status.ok()) { return WithContext(status, "create business-memory provider failed"); }
+    if (!status.ok()) {
+        return FailInit(WithContext(status, "create business-memory provider failed"));
+    }
     if (!memoryProvider) {
-        return Status::Error(StatusCode::INTERNAL_ERROR,
-                             "business-memory provider factory returned null");
+        return FailInit(Status::Error(StatusCode::INTERNAL_ERROR,
+                                          "business-memory provider factory returned null"));
     }
     {
         std::lock_guard<std::mutex> memoryLock{memoryMu_};
@@ -164,16 +172,7 @@ Status KvClientImpl::Init(const KvClientConfig& config)
     if (status.ok()) {
         status = ApplyUniverse(universe, std::move(initialSnapshots), true);
     }
-    if (!status.ok()) {
-        (void)transportPool_.ShutdownAll();
-        {
-            std::lock_guard<std::mutex> memoryLock{memoryMu_};
-            providerMemoryStates_.clear();
-            memoryProvider_.reset();
-        }
-        viewUniverse_.reset();
-        return status;
-    }
+    if (!status.ok()) { return FailInit(status); }
 
     taskQueue_.Setup(queueDepth + 1);
     stopWorker_.store(false, std::memory_order_release);
@@ -191,10 +190,17 @@ Status KvClientImpl::Init(const KvClientConfig& config)
         // not acceptable: roll back and report the failure.
         KV_ERROR("Refresh scheduler start failed: code={} message={}",
                  static_cast<int>(startStatus.code), startStatus.message);
-        (void)Shutdown();
-        return startStatus;
+        return FailInit(startStatus);
     }
     return Status::OK();
+}
+
+Status KvClientImpl::FailInit(Status status)
+{
+    // Reuse the normal shutdown path so a failed Init leaves no view server, transport
+    // pool or provider state behind, exactly like a successfully shut down client.
+    (void)Shutdown();
+    return status;
 }
 
 Status KvClientImpl::Shutdown()
@@ -255,9 +261,13 @@ Status KvClientImpl::QueryAsync(const std::vector<CacheKey>& keys, TaskId& taskI
 
 Status KvClientImpl::QueryAsync(KvNsId nsId, const std::vector<CacheKey>& keys, TaskId& taskId)
 {
+    // A submission failure means the caller passed something the published view cannot
+    // serve (unknown namespace, missing namespace for a multi-namespace client, queue
+    // full). Refreshing on it would turn caller errors into refresh traffic; the refresh
+    // is driven by execution results instead (Wait and the worker path), like the other
+    // operations.
     auto status = SubmitAsync(AsuOpType::QUERY, nsId, keys, taskId);
     RecordSubmit(AsuOpType::QUERY, keys.size(), status);
-    if (IsRefreshNeeded(status)) { TriggerRefresh(status); }
     return status;
 }
 

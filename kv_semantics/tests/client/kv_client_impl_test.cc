@@ -2573,7 +2573,7 @@ TEST(KvClientImplTest, TaskBuild_UnroutableEntriesReportNoAvailableNode)
     TaskResult result;
     const auto status = client->Wait(taskId, 1000, result);
 
-    EXPECT_EQ(status.code, StatusCode::PARTIAL_FAILED);
+    EXPECT_EQ(status.code, StatusCode::NO_AVAILABLE_NODE);
     ASSERT_EQ(result.entryStatus.size(), std::size_t{2});
     for (const auto& entryStatus : result.entryStatus) {
         EXPECT_EQ(entryStatus.code, StatusCode::NO_AVAILABLE_NODE);
@@ -2789,6 +2789,8 @@ TEST(KvClientImplTest, MultiNs_UnknownNsReturnsNotFound)
     EXPECT_EQ(status.code, StatusCode::NOT_FOUND);
     EXPECT_NE(status.message.find("999"), std::string::npos);
     EXPECT_TRUE(state->queryCalls.empty());
+    // A caller error must not be turned into refresh traffic.
+    EXPECT_EQ(viewServer->FetchCount(), std::size_t{1});
     ASSERT_TRUE(client->Shutdown().ok());
 }
 
@@ -3364,6 +3366,64 @@ TEST(KvClientImplTest, Refresh_AdoptsChangedEndpoints)
     ASSERT_EQ(state->initConfigs.at(NodeId{10}).endpoints.size(), std::size_t{1});
     EXPECT_EQ(state->initConfigs.at(NodeId{10}).endpoints[0].ip, "10.0.0.2");
 
+    QueryResult result;
+    EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
+    ASSERT_TRUE(client->Shutdown().ok());
+}
+
+
+// Fails exactly the first GetAllViews call, so a retried Init can succeed afterwards.
+class FailingOnceViewServer final : public ViewServer {
+public:
+    Status GetGlobalView(GlobalView& view) override
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (failFirst_) {
+            failFirst_ = false;
+            return Status::Error(StatusCode::IO_ERROR, "injected view fetch failure");
+        }
+        view = MakeView(1);
+        return Status::OK();
+    }
+
+    Status GetAllViews(ViewUniverse& universe) override
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (failFirst_) {
+            failFirst_ = false;
+            return Status::Error(StatusCode::IO_ERROR, "injected view fetch failure");
+        }
+        std::unordered_map<KvNsId, GlobalView> views;
+        views.emplace(kDefaultKvNsId, MakeView(1));
+        ViewUniverse next(views, 1);
+        return universe.ReplaceAll(next);
+    }
+
+private:
+    static GlobalView MakeView(std::uint64_t viewEpoch)
+    {
+        GlobalView view;
+        view.viewEpoch = viewEpoch;
+        view.asuMap.emplace(NodeId{10}, NodeInfo{});
+        return view;
+    }
+
+    mutable std::mutex mutex_;
+    bool failFirst_{true};
+};
+
+TEST(KvClientImplTest, Lifecycle_InitFailureRollsBackAndAllowsRetry)
+{
+    auto state = std::make_shared<TestState>();
+    auto viewServer = std::make_shared<FailingOnceViewServer>();
+    auto client =
+        std::make_unique<KvClientImpl>(MakeFactory(state), MakeViewServerFactory(viewServer));
+
+    // The first Init fails while fetching the view.
+    EXPECT_EQ(client->Init(MakeConfig({10})).code, StatusCode::IO_ERROR);
+
+    // The failed Init rolled everything back: the retry initializes normally.
+    ASSERT_TRUE(client->Init(MakeConfig({10})).ok());
     QueryResult result;
     EXPECT_TRUE(QueryAndWait(*client, {MakeCacheKey("k05")}, result).ok());
     ASSERT_TRUE(client->Shutdown().ok());
