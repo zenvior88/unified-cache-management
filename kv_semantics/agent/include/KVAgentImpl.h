@@ -74,7 +74,8 @@ public:
     virtual int32_t kv_agent_create_ceph_pool_async(char* kvPoolName, uint32_t kvPoolLen,
                                                     char* kvnsName, uint32_t kvnsLen,
                                                     KVAgentAsyncCallback cb, void* user_data) = 0;
-    virtual int32_t kv_agent_delete_ceph_pool_async(char* kvnsName, uint32_t nameLen,
+    virtual int32_t kv_agent_delete_ceph_pool_async(char* kvPoolName, uint32_t kvPoolLen,
+                                                    char* kvnsName, uint32_t kvnsLen,
                                                     KVAgentAsyncCallback cb, void* user_data) = 0;
     virtual int32_t kv_agent_osd_out_async(KVAgentAsyncCallback cb, void* user_data) = 0;
     virtual int32_t kv_agent_osd_crush_rm_async(KVAgentAsyncCallback cb, void* user_data) = 0;

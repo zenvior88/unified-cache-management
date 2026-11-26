@@ -39,6 +39,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <system_error>
 #include <thread>
@@ -50,6 +51,7 @@
 #include "common/async/context_pool.h"
 #include "common/ceph_argparse.h"
 #include "common/ceph_context.h"
+#include "common/ceph_json.h"
 #include "common/ceph_mutex.h"
 #include "common/common_init.h"
 #include "common/config.h"
@@ -80,6 +82,24 @@ constexpr int INIT_RETRY_INTERVAL_SEC = 60;
 constexpr int KV_OSD_AGENT_DEFAULT_PORT = 6800;
 // 创建 kv 命名空间 pool 时使用的 pg_num 固定值
 constexpr int KV_OSD_AGENT_PG_NUM = 4;
+
+std::string make_crush_root_name(std::string_view kv_pool)
+{
+    return std::string(kv_pool) + "-root";
+}
+
+std::string make_crush_rule_name(std::string_view kv_pool)
+{
+    return std::string(kv_pool) + "-rule";
+}
+
+// Append the KV Pool byte length to distinguish (a-b, c) from (a, b-c).
+std::string make_ceph_pool_name(std::string_view kv_pool, std::string_view kv_ns)
+{
+    if (kv_pool.empty() || kv_ns.empty()) { return {}; }
+    return std::string(kv_pool) + '-' + std::string(kv_ns) + '-' +
+           std::to_string(kv_pool.size()) + "-pool";
+}
 
 int parse_public_addrs(const std::string& value, entity_addrvec_t* result,
                        AgentLogger* logger = nullptr)
@@ -851,9 +871,8 @@ public:
         AGENT_LOG(logger, ::agent::LogLevel::INFO,
                   "All " + std::to_string(listSize) + " OSDs verified to exist in cluster");
 
-        std::string kvPoolNameString = std::string(kvPoolName);
-        std::string rootName = kvPoolNameString + "-root";
-        std::string ruleName = kvPoolNameString + "-rule";
+        const auto rootName = make_crush_root_name(kvPoolName);
+        const auto ruleName = make_crush_rule_name(kvPoolName);
 
         // 打点计时: 创建 root bucket 耗时
         const auto t_root_start = std::chrono::steady_clock::now();
@@ -950,9 +969,8 @@ public:
             return -1;
         }
 
-        std::string kvPoolNameString = std::string(kvPoolName);
-        std::string rootName = kvPoolNameString + "-root";
-        std::string ruleName = kvPoolNameString + "-rule";
+        const auto rootName = make_crush_root_name(kvPoolName);
+        const auto ruleName = make_crush_rule_name(kvPoolName);
 
         // -------- 使用已认证的 monc --------
         ceph::bufferlist outbl;
@@ -1150,9 +1168,12 @@ public:
             return -1;
         }
         // -------- 使用已认证的 monc --------
-        std::string kvPoolNameString = std::string(kvPoolName);
-        std::string kvnsNameString = std::string(kvnsName);
-        std::string ruleName = kvPoolNameString + "-rule";
+        const auto kvnsNameString = make_ceph_pool_name(kvPoolName, kvnsName);
+        if (kvnsNameString.empty()) {
+            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "KV pool and KVNS names must not be empty");
+            return -EINVAL;
+        }
+        const auto ruleName = make_crush_rule_name(kvPoolName);
 
         ceph::bufferlist outbl;
         std::string outs;
@@ -1227,48 +1248,45 @@ public:
         return 0;
     }
 
-    // 删除ceph pool
-    int32_t kv_agent_delete_ceph_pool_impl(char* kvnsName,
-                                           uint32_t nameLen)  // NOLINT(g.STD.02-cpp)
+    int32_t kv_agent_delete_ceph_pool_impl(std::string_view kvPoolName, std::string_view kvnsName)
     {
-        // -------- 输入合法性检测 --------
-        if (kvnsName == nullptr || strnlen(kvnsName, nameLen + 1) != nameLen) {
-            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Invalid kvnsName");
-            return -1;
+        const auto poolName = make_ceph_pool_name(kvPoolName, kvnsName);
+        if (poolName.empty() || kvPoolName.find('\0') != std::string_view::npos ||
+            kvnsName.find('\0') != std::string_view::npos) {
+            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Invalid KV pool or KVNS name");
+            return -EINVAL;
         }
-        // -------- 使用已认证的 monc --------
-        std::string kvnsNameString = std::string(kvnsName);
 
         ceph::bufferlist outbl;
         std::string outs;
-
-        // -------- 检查 ceph pool 是否存在 --------
-        outbl.clear();
-        outs.clear();
-        int32_t ret = mon_command_sync({R"({"prefix": "osd pool ls"})"}, &outbl, &outs);
+        int32_t ret = mon_command_sync(
+            {R"({"prefix":"osd pool get","pool":")" + poolName + R"(","var":"crush_rule","format":"json"})"},
+            &outbl, &outs);
+        if (ret == -ENOENT) { return 0; }
         if (ret < 0) {
-            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Failed to query pool list: " + outs);
+            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Failed to query Ceph pool: " + outs);
             return ret;
         }
 
-        std::string pool_list_str = outbl.to_str();
-        if (pool_list_str.find("\"" + kvnsNameString + "\"") == std::string::npos &&
-            pool_list_str.find(kvnsNameString) == std::string::npos) {
-            AGENT_LOG(logger, ::agent::LogLevel::WARNING,
-                      "Ceph pool " + kvnsNameString + " does not exist");
-            return 0;
+        JSONParser response;
+        auto* rule = response.parse(outbl.c_str(), outbl.length())
+                         ? response.find_obj("crush_rule")
+                         : nullptr;
+        if (!rule || !rule->get_data_val().quoted) {
+            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Invalid CRUSH rule reply for " + poolName);
+            return -EIO;
         }
-        AGENT_LOG(logger, ::agent::LogLevel::INFO,
-                  "Ceph pool " + kvnsNameString + " exists, proceeding to delete");
-
-        // -------- 删除 ceph pool --------
-        // 命令格式: ceph osd pool delete <pool-name> <pool-name> --yes-i-really-really-mean-it
+        if (rule->get_data() != make_crush_rule_name(kvPoolName)) {
+            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Unexpected CRUSH rule for " + poolName);
+            return -EEXIST;
+        }
         outbl.clear();
         outs.clear();
         ret = mon_command_sync(
-            {std::string("{\"prefix\": \"osd pool delete\", \"pool\": \"") + kvnsNameString +
-             "\", \"pool2\": \"" + kvnsNameString + "\", \"yes_i_really_really_mean_it\": true}"},
+            {std::string("{\"prefix\": \"osd pool delete\", \"pool\": \"") + poolName +
+             "\", \"pool2\": \"" + poolName + "\", \"yes_i_really_really_mean_it\": true}"},
             &outbl, &outs);
+        if (ret == -ENOENT) { return 0; }
         if (ret < 0) {
             AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Failed to delete ceph pool: " + outs);
             return ret;
@@ -1334,7 +1352,7 @@ public:
             return -1;
         }
 
-        std::string root_name = std::string(kvPoolName) + "-root";
+        const auto root_name = make_crush_root_name(kvPoolName);
         ceph::bufferlist outbl;
         std::string outs;
 
@@ -1437,19 +1455,15 @@ public:
             std::move(cb), user_data);
     }
 
-    int32_t kv_agent_delete_ceph_pool_async(char* kvnsName, uint32_t nameLen,
-                                            KVAgentAsyncCallback cb, void* user_data) override
+    int32_t kv_agent_delete_ceph_pool_async(char* kvPoolName, uint32_t kvPoolLen, char* kvnsName,
+                                            uint32_t kvnsLen, KVAgentAsyncCallback cb,
+                                            void* user_data) override
     {
-        // 入队前拷贝调用方缓冲区: worker 延迟执行期间调用方可能释放/复用内存,
-        // 直接持有裸指针存在悬垂读风险. 拷贝值随 lambda (std::function) 一同
-        // 存活, 因此任务执行期间始终安全.
-        const std::string ns_name = kvnsName ? std::string(kvnsName, nameLen) : std::string();
+        // Copy both names before enqueueing.
+        const std::string pool_name = kvPoolName ? std::string(kvPoolName, kvPoolLen) : std::string();
+        const std::string ns_name = kvnsName ? std::string(kvnsName, kvnsLen) : std::string();
         return async_dispatch(
-            [this, ns_name, nameLen]() {
-                // 空拷贝还原为 nullptr, 保持与 impl 判空语义一致
-                const char* ns_name_data = ns_name.empty() ? nullptr : ns_name.data();
-                return kv_agent_delete_ceph_pool_impl(const_cast<char*>(ns_name_data), nameLen);
-            },
+            [this, pool_name, ns_name]() { return kv_agent_delete_ceph_pool_impl(pool_name, ns_name); },
             std::move(cb), user_data);
     }
 

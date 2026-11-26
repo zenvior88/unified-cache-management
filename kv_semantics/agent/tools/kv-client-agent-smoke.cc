@@ -24,6 +24,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -66,10 +67,13 @@ void print_nodes(const char* label, const std::vector<agent::KVClientNodeView>& 
 
 int main(int argc, const char** argv)
 {
+    const char* mon_host = get_arg(argc, argv, "--mon-host");
+    const char* client_name = get_arg(argc, argv, "--client-name");
+    const char* client_key = get_arg(argc, argv, "--client-key");
     agent::KVClientAgentConfig config{
-        .mon_host = get_arg(argc, argv, "--mon-host"),
-        .client_name = get_arg(argc, argv, "--client-name"),
-        .client_key = get_arg(argc, argv, "--client-key"),
+        .mon_host = mon_host ? mon_host : "",
+        .client_name = client_name ? client_name : "",
+        .client_key = client_key ? client_key : "",
         .view_refresh_interval = 0,  // 使用默认值 KV_VIEW_REFRESH_INTERVAL_DEFAULT
         .view_fetch_timeout = 0,     // 使用默认值 KV_VIEW_FETCH_TIMEOUT_DEFAULT
     };
@@ -78,18 +82,21 @@ int main(int argc, const char** argv)
     const char* ns_name = get_arg(argc, argv, "--ns");
     bool flag_get_in = has_flag(argc, argv, "--get-in");
     const char* get_in_ns = get_arg(argc, argv, "--get-in-by-ns");
+    const char* expected_in = get_arg(argc, argv, "--expect-in-osds");
     bool flag_get_all_ns = has_flag(argc, argv, "--get-all-ns");
     const char* up_in_ns = get_arg(argc, argv, "--get-up-in-by-ns");
     const char* down_in_ns = get_arg(argc, argv, "--get-down-in-by-ns");
     const char* up_out_ns = get_arg(argc, argv, "--get-up-out-by-ns");
     const char* down_out_ns = get_arg(argc, argv, "--get-down-out-by-ns");
     unsigned wait_seconds = wait_arg ? std::strtoul(wait_arg, nullptr, 10) : 2;
-    if (config.mon_host.empty() || config.client_name.empty() || config.client_key.empty()) {
+    if (config.mon_host.empty() || config.client_name.empty() || config.client_key.empty() ||
+        (has_flag(argc, argv, "--expect-in-osds") && (!get_in_ns || !expected_in))) {
         std::cerr << "usage: kv-client-agent-smoke --mon-host <hosts> "
                      "--client-name <client.name> --client-key <cephx-key> "
                      "[--log-dir <directory>] [--wait <seconds>] "
-                     "[--ns <namespace>] [--get-in] "
-                     "[--get-in-by-ns <namespace>] [--get-all-ns] "
+                     "[--ns <kvns-name>] [--get-in] "
+                     "[--get-in-by-ns <kvns-name> [--expect-in-osds <0,1,...|none>]] "
+                     "[--get-all-ns] "
                      "[--get-up-in-by-ns <ns>] [--get-down-in-by-ns <ns>] "
                      "[--get-up-out-by-ns <ns>] [--get-down-out-by-ns <ns>]"
                   << std::endl;
@@ -147,12 +154,31 @@ int main(int argc, const char** argv)
 
         // get_in_by_ns: 按 ns 查询 in 状态 OSD
         if (get_in_ns) {
+            if (expected_in && client.get_epoch() == 0) {
+                std::cerr << "No OSDMap received; increase --wait\n";
+                return EXIT_FAILURE;
+            }
             std::cout << "--- get_in_by_ns: " << get_in_ns << " ---" << std::endl;
             auto in_ns_nodes = client.get_in_by_ns(get_in_ns);
             if (in_ns_nodes.empty()) {
                 std::cout << "get_in_by_ns: (none)" << std::endl;
             } else {
                 print_nodes("in_ns", in_ns_nodes);
+            }
+            if (expected_in) {
+                std::sort(in_ns_nodes.begin(), in_ns_nodes.end(),
+                          [](const auto& lhs, const auto& rhs) { return lhs.osd_id < rhs.osd_id; });
+                std::string actual;
+                for (const auto& node : in_ns_nodes) {
+                    if (!actual.empty()) { actual += ','; }
+                    actual += std::to_string(node.osd_id);
+                }
+                if (actual.empty()) { actual = "none"; }
+                if (actual != expected_in) {
+                    std::cerr << "Expected in OSDs for " << get_in_ns << ": " << expected_in
+                              << "; got " << actual << '\n';
+                    return EXIT_FAILURE;
+                }
             }
         }
 

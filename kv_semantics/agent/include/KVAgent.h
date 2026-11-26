@@ -101,8 +101,9 @@ KV_AGENT_EXPORT int32_t kv_agent_create_ceph_pool_async(kv_agent_handle* agent, 
                                                         uint32_t kvPoolLen, char* kvnsName,
                                                         uint32_t kvnsLen, kv_agent_async_cb cb,
                                                         void* user_data);
-KV_AGENT_EXPORT int32_t kv_agent_delete_ceph_pool_async(kv_agent_handle* agent, char* kvnsName,
-                                                        uint32_t nameLen, kv_agent_async_cb cb,
+KV_AGENT_EXPORT int32_t kv_agent_delete_ceph_pool_async(kv_agent_handle* agent, char* kvPoolName,
+                                                        uint32_t kvPoolLen, char* kvnsName,
+                                                        uint32_t kvnsLen, kv_agent_async_cb cb,
                                                         void* user_data);
 KV_AGENT_EXPORT int32_t kv_agent_osd_out_async(kv_agent_handle* agent, kv_agent_async_cb cb,
                                                void* user_data);

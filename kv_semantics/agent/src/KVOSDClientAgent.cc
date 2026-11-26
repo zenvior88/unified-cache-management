@@ -17,6 +17,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -192,30 +193,7 @@ public:
         std::lock_guard guard(lock);
         std::vector<KVClientNodeView> result;
 
-        int64_t pool_id = osdmap.lookup_pg_pool_name(ns);
-        if (pool_id < 0) {
-            AGENT_LOG(logger, LogLevel::WARNING, "ns view: pool name not found: " + ns);
-            return result;
-        }
-
-        int rule_id = osdmap.get_pool_crush_rule(pool_id);
-
-        std::set<int> roots;
-        osdmap.crush->find_takes_by_rule(rule_id, &roots);
-        if (roots.empty()) {
-            AGENT_LOG(logger, LogLevel::WARNING,
-                      "ns view: no crush roots for rule " + std::to_string(rule_id));
-            return result;
-        }
-
-        std::set<int32_t> pool_osds;
-        for (int root : roots) {
-            std::set<int> children;
-            osdmap.crush->get_all_children(root, &children);
-            pool_osds.insert(children.begin(), children.end());
-        }
-
-        for (int32_t osd : pool_osds) {
+        for (int32_t osd : get_ns_osds(ns)) {
             if (osd < 0 || !osdmap.exists(osd)) { continue; }
             if (osdmap.is_up(osd) != up || osdmap.is_in(osd) != in) { continue; }
             KVClientNodeView node{
@@ -282,29 +260,7 @@ public:
         std::lock_guard guard(lock);
         std::vector<KVClientNodeView> result;
 
-        int64_t pool_id = osdmap.lookup_pg_pool_name(ns);
-        if (pool_id < 0) {
-            AGENT_LOG(logger, LogLevel::WARNING, "get_in_by_ns: pool name not found: " + ns);
-            return result;
-        }
-
-        int rule_id = osdmap.get_pool_crush_rule(pool_id);
-        std::set<int> roots;
-        osdmap.crush->find_takes_by_rule(rule_id, &roots);
-        if (roots.empty()) {
-            AGENT_LOG(logger, LogLevel::WARNING,
-                      "get_in_by_ns: no crush roots for rule " + std::to_string(rule_id));
-            return result;
-        }
-
-        std::set<int32_t> pool_osds;
-        for (int root : roots) {
-            std::set<int> children;
-            osdmap.crush->get_all_children(root, &children);
-            pool_osds.insert(children.begin(), children.end());
-        }
-
-        for (int32_t osd : pool_osds) {
+        for (int32_t osd : get_ns_osds(ns)) {
             if (osd < 0 || !osdmap.exists(osd)) { continue; }
             if (!osdmap.is_in(osd)) { continue; }
             KVClientNodeView node{
@@ -326,13 +282,12 @@ public:
     std::vector<std::string> get_all_ns_names() const override
     {
         std::lock_guard guard(lock);
-        std::vector<std::string> result;
-        const auto& pools = osdmap.get_pools();
-        for (const auto& [pool_id, pool] : pools) {
-            auto name = osdmap.get_pool_name(pool_id);
-            if (!name.empty()) { result.push_back(std::move(name)); }
+        std::set<std::string> names;
+        for (const auto& [pool_id, pool] : osdmap.get_pools()) {
+            auto ns = extract_kvns_name(osdmap.get_pool_name(pool_id), pool.get_crush_rule());
+            if (!ns.empty()) { names.insert(std::move(ns)); }
         }
-        return result;
+        return {names.begin(), names.end()};
     }
 
     // --- 视图刷新 ---
@@ -384,6 +339,66 @@ public:
     }
 
 private:
+    // Use the rule to verify the KV Pool prefix and its byte length suffix.
+    std::string extract_kvns_name(std::string_view pool_name, int rule_id) const
+    {
+        constexpr std::string_view pool_suffix = "-pool";
+        constexpr std::string_view rule_suffix = "-rule";
+        if (!pool_name.ends_with(pool_suffix)) { return {}; }
+
+        const char* name = osdmap.crush->get_rule_name(rule_id);
+        if (!name) { return {}; }
+        std::string_view kv_pool(name);
+        if (!kv_pool.ends_with(rule_suffix) || kv_pool.size() == rule_suffix.size()) { return {}; }
+        kv_pool.remove_suffix(rule_suffix.size());
+
+        pool_name.remove_suffix(pool_suffix.size());
+        const auto length_suffix = '-' + std::to_string(kv_pool.size());
+        if (!pool_name.ends_with(length_suffix)) { return {}; }
+        pool_name.remove_suffix(length_suffix.size());
+        if (!pool_name.starts_with(kv_pool)) { return {}; }
+        pool_name.remove_prefix(kv_pool.size());
+        if (pool_name.size() <= 1 || pool_name.front() != '-') { return {}; }
+        return std::string(pool_name.substr(1));
+    }
+
+    // The caller holds lock so all members are resolved against the same OSDMap.
+    std::set<int32_t> get_ns_osds(const std::string& ns) const
+    {
+        if (ns.empty()) { return {}; }
+        std::set<int32_t> osds;
+        for (const auto& [pool_id, pool] : osdmap.get_pools()) {
+            const auto pool_name = osdmap.get_pool_name(pool_id);
+            const int rule_id = pool.get_crush_rule();
+            if (extract_kvns_name(pool_name, rule_id) != ns) { continue; }
+
+            std::set<int> roots;
+            osdmap.crush->find_takes_by_rule(rule_id, &roots);
+            if (roots.empty()) {
+                AGENT_LOG(logger, LogLevel::ERROR,
+                          "ns view: skipping pool " + pool_name + " for ns " + ns +
+                              ", no CRUSH roots for rule " + std::to_string(rule_id));
+                continue;
+            }
+
+            std::set<int> member_osds;
+            bool valid = true;
+            for (int root : roots) {
+                const int ret = osdmap.crush->get_all_children(root, &member_osds);
+                if (ret < 0) {
+                    AGENT_LOG(logger, LogLevel::ERROR,
+                              "ns view: skipping pool " + pool_name + " for ns " + ns +
+                                  ", rule=" + std::to_string(rule_id) +
+                                  ", root=" + std::to_string(root) + ", ret=" + std::to_string(ret));
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid) { osds.insert(member_osds.begin(), member_osds.end()); }
+        }
+        return osds;
+    }
+
     // --- Connection failure notification ---
 
     // 连接被 reset/refused 时清除 pending fetch 并唤醒 refresher,

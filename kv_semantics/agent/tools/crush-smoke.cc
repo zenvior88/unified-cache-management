@@ -156,13 +156,14 @@ int main(int argc, const char** argv)
         // Delete operations only (for cleanup after failed create)
         std::cerr << "[trace] === delete-only mode ===" << std::endl;
 
-        std::cerr << "[trace] calling kv_agent_delete_ceph_pool ns=" << ns_name_str << std::endl;
-        ASYNC_CALL(kv_agent_delete_ceph_pool_async(agent, const_cast<char*>(ns_name_str.c_str()),
-                                                   static_cast<uint32_t>(ns_name_str.size()),
-                                                   AsyncWaitCb, &_ctx));
+        std::cerr << "[trace] deleting member " << pool_name_str << "/" << ns_name_str << std::endl;
+        ASYNC_CALL(kv_agent_delete_ceph_pool_async(
+            agent, pool_name_str.data(), static_cast<uint32_t>(pool_name_str.size()),
+            ns_name_str.data(), static_cast<uint32_t>(ns_name_str.size()), AsyncWaitCb, &_ctx));
         std::cerr << "[trace] kv_agent_delete_ceph_pool result=" << result << std::endl;
         if (result != 0) {
-            std::cerr << "kv_agent_delete_ceph_pool failed: " << result << std::endl;
+            kv_agent_destroy(agent);
+            return EXIT_FAILURE;
         }
 
         int32_t osdIdList_empty[1] = {0};
@@ -195,49 +196,34 @@ int main(int argc, const char** argv)
         std::cerr << "[trace] kv_agent_create_crush_root result=" << result << std::endl;
         if (result != 0) {
             std::cerr << "kv_agent_create_crush_root failed: " << result << std::endl;
-            std::cerr << "[trace] cleanup: calling kv_agent_delete_crush_root for rollback"
-                      << std::endl;
-            AsyncWaitCtx rb_ctx;
-            kv_agent_delete_crush_root_async(agent, const_cast<char*>(pool_name_str.c_str()),
-                                             static_cast<uint32_t>(pool_name_str.size()),
-                                             osdIdList_empty, 1, AsyncWaitCb, &rb_ctx);
-            (void)AsyncWait(rb_ctx);
             kv_agent_destroy(agent);
             return EXIT_FAILURE;
         }
 
-        // Step 2: Create Ceph pool (depends on CRUSH rule created by kv_agent_create_crush_root)
-        std::cerr << "[trace] calling kv_agent_create_ceph_pool pool=" << pool_name_str
-                  << " ns=" << ns_name_str << std::endl;
-        ASYNC_CALL(kv_agent_create_ceph_pool_async(
-            agent, const_cast<char*>(pool_name_str.c_str()),
-            static_cast<uint32_t>(pool_name_str.size()), const_cast<char*>(ns_name_str.c_str()),
-            static_cast<uint32_t>(ns_name_str.size()), AsyncWaitCb, &_ctx));
-        std::cerr << "[trace] kv_agent_create_ceph_pool result=" << result << std::endl;
-        if (result != 0) {
-            std::cerr << "kv_agent_create_ceph_pool failed: " << result << std::endl;
-            std::cerr << "[trace] cleanup: calling kv_agent_delete_crush_root for rollback"
-                      << std::endl;
-            AsyncWaitCtx rb_ctx;
-            kv_agent_delete_crush_root_async(agent, const_cast<char*>(pool_name_str.c_str()),
-                                             static_cast<uint32_t>(pool_name_str.size()),
-                                             osdIdList_empty, 0, AsyncWaitCb, &rb_ctx);
-            (void)AsyncWait(rb_ctx);
-            kv_agent_destroy(agent);
-            return EXIT_FAILURE;
+        // Step 2: Create the member twice to check idempotency.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            ASYNC_CALL(kv_agent_create_ceph_pool_async(
+                agent, pool_name_str.data(), static_cast<uint32_t>(pool_name_str.size()),
+                ns_name_str.data(), static_cast<uint32_t>(ns_name_str.size()), AsyncWaitCb, &_ctx));
+            std::cerr << "[trace] kv_agent_create_ceph_pool result=" << result << std::endl;
+            if (result != 0) {
+                kv_agent_destroy(agent);
+                return EXIT_FAILURE;
+            }
         }
 
         std::cerr << "[trace] === delete phase ===" << std::endl;
 
-        // Step 3: Delete Ceph pool
-        std::cerr << "[trace] calling kv_agent_delete_ceph_pool ns=" << ns_name_str << std::endl;
-        ASYNC_CALL(kv_agent_delete_ceph_pool_async(agent, const_cast<char*>(ns_name_str.c_str()),
-                                                   static_cast<uint32_t>(ns_name_str.size()),
-                                                   AsyncWaitCb, &_ctx));
-        std::cerr << "[trace] kv_agent_delete_ceph_pool result=" << result << std::endl;
-        if (result != 0) {
-            std::cerr << "kv_agent_delete_ceph_pool failed: " << result << std::endl;
-            // Continue to delete crush root anyway
+        // Step 3: Delete the same member twice to check idempotency.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            ASYNC_CALL(kv_agent_delete_ceph_pool_async(
+                agent, pool_name_str.data(), static_cast<uint32_t>(pool_name_str.size()),
+                ns_name_str.data(), static_cast<uint32_t>(ns_name_str.size()), AsyncWaitCb, &_ctx));
+            std::cerr << "[trace] kv_agent_delete_ceph_pool result=" << result << std::endl;
+            if (result != 0) {
+                kv_agent_destroy(agent);
+                return EXIT_FAILURE;
+            }
         }
 
         // Step 4: Delete CRUSH root
@@ -249,6 +235,8 @@ int main(int argc, const char** argv)
         std::cerr << "[trace] kv_agent_delete_crush_root result=" << result << std::endl;
         if (result != 0) {
             std::cerr << "kv_agent_delete_crush_root failed: " << result << std::endl;
+            kv_agent_destroy(agent);
+            return EXIT_FAILURE;
         }
     } else {
         // Create only mode

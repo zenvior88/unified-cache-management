@@ -197,10 +197,9 @@ extern "C" KV_AGENT_EXPORT int32_t kv_agent_create_ceph_pool_async(
         [cb](int32_t result, void* ud) { cb(result, ud); }, user_data);
 }
 
-extern "C" KV_AGENT_EXPORT int32_t kv_agent_delete_ceph_pool_async(kv_agent_handle* agent,
-                                                                   char* kvnsName, uint32_t nameLen,
-                                                                   kv_agent_async_cb cb,
-                                                                   void* user_data)
+extern "C" KV_AGENT_EXPORT int32_t kv_agent_delete_ceph_pool_async(
+    kv_agent_handle* agent, char* kvPoolName, uint32_t kvPoolLen, char* kvnsName, uint32_t kvnsLen,
+    kv_agent_async_cb cb, void* user_data)
 {
     if (!agent || !agent->impl || !cb) {
         AGENT_LOG(nullptr, ::agent::LogLevel::ERROR,
@@ -209,7 +208,8 @@ extern "C" KV_AGENT_EXPORT int32_t kv_agent_delete_ceph_pool_async(kv_agent_hand
     }
 
     return agent->impl->kv_agent_delete_ceph_pool_async(
-        kvnsName, nameLen, [cb](int32_t result, void* ud) { cb(result, ud); }, user_data);
+        kvPoolName, kvPoolLen, kvnsName, kvnsLen,
+        [cb](int32_t result, void* ud) { cb(result, ud); }, user_data);
 }
 
 extern "C" KV_AGENT_EXPORT int32_t kv_agent_osd_out_async(kv_agent_handle* agent,
