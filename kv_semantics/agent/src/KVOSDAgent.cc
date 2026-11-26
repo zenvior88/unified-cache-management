@@ -28,6 +28,7 @@
 #include <atomic>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/system/error_code.hpp>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -97,8 +98,8 @@ std::string make_crush_rule_name(std::string_view kv_pool)
 std::string make_ceph_pool_name(std::string_view kv_pool, std::string_view kv_ns)
 {
     if (kv_pool.empty() || kv_ns.empty()) { return {}; }
-    return std::string(kv_pool) + '-' + std::string(kv_ns) + '-' +
-           std::to_string(kv_pool.size()) + "-pool";
+    return std::string(kv_pool) + '-' + std::string(kv_ns) + '-' + std::to_string(kv_pool.size()) +
+           "-pool";
 }
 
 int parse_public_addrs(const std::string& value, entity_addrvec_t* result,
@@ -1259,9 +1260,9 @@ public:
 
         ceph::bufferlist outbl;
         std::string outs;
-        int32_t ret = mon_command_sync(
-            {R"({"prefix":"osd pool get","pool":")" + poolName + R"(","var":"crush_rule","format":"json"})"},
-            &outbl, &outs);
+        int32_t ret = mon_command_sync({R"({"prefix":"osd pool get","pool":")" + poolName +
+                                        R"(","var":"crush_rule","format":"json"})"},
+                                       &outbl, &outs);
         if (ret == -ENOENT) { return 0; }
         if (ret < 0) {
             AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Failed to query Ceph pool: " + outs);
@@ -1269,9 +1270,8 @@ public:
         }
 
         JSONParser response;
-        auto* rule = response.parse(outbl.c_str(), outbl.length())
-                         ? response.find_obj("crush_rule")
-                         : nullptr;
+        auto* rule = response.parse(outbl.c_str(), outbl.length()) ? response.find_obj("crush_rule")
+                                                                   : nullptr;
         if (!rule || !rule->get_data_val().quoted) {
             AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Invalid CRUSH rule reply for " + poolName);
             return -EIO;
@@ -1460,10 +1460,13 @@ public:
                                             void* user_data) override
     {
         // Copy both names before enqueueing.
-        const std::string pool_name = kvPoolName ? std::string(kvPoolName, kvPoolLen) : std::string();
+        const std::string pool_name =
+            kvPoolName ? std::string(kvPoolName, kvPoolLen) : std::string();
         const std::string ns_name = kvnsName ? std::string(kvnsName, kvnsLen) : std::string();
         return async_dispatch(
-            [this, pool_name, ns_name]() { return kv_agent_delete_ceph_pool_impl(pool_name, ns_name); },
+            [this, pool_name, ns_name]() {
+                return kv_agent_delete_ceph_pool_impl(pool_name, ns_name);
+            },
             std::move(cb), user_data);
     }
 
@@ -2241,48 +2244,23 @@ private:
         return (result < 0) ? result : 0;
     }
 
-    // 查询 crush map，解析当前已挂在目标 root 下的 OSD 集合，供 moveOsd 幂等判断
-    std::vector<int32_t> getOsdsInRoot(std::string rootName)
+    // KV Pool roots directly contain proxy OSDs, with no host or other nested buckets.
+    // ls-tree lists descendant OSDs, which in this layout are also direct children.
+    // Use it for membership checks only: an empty list does not rule out empty child buckets.
+    std::vector<int32_t> getOsdsInRoot(const std::string& rootName)
     {
-        std::vector<int32_t> osds_in_root;
         ceph::bufferlist outbl;
         std::string outs;
-        int32_t dump_ret = mon_command_sync({R"({"prefix": "osd crush dump"})"}, &outbl, &outs);
-        if (dump_ret < 0) {
+        int32_t ret = mon_command_sync(
+            {R"({"prefix": "osd ls-tree", "name":")" + rootName + R"(","format":"plain"})"}, &outbl,
+            &outs);
+        if (ret == -ENOENT) { return {}; }
+        if (ret < 0) {
             AGENT_LOG(logger, ::agent::LogLevel::WARNING,
-                      "Failed to query crush dump, skip already-in-root check: " + outs);
-            return osds_in_root;
+                      "Failed to query osd ls-tree, skip already-in-root check: " + outs);
+            return {};
         }
-
-        std::string crush_dump_output = outbl.to_str();
-        size_t root_name_pos = crush_dump_output.find("\"" + rootName + "\"");
-        if (root_name_pos == std::string::npos) { return osds_in_root; }
-
-        size_t items_start = crush_dump_output.find("\"items\"", root_name_pos);
-        if (items_start == std::string::npos) { return osds_in_root; }
-        size_t bracket_start = crush_dump_output.find("[", items_start);
-        size_t bracket_end = crush_dump_output.find("]", bracket_start);
-        if (bracket_start == std::string::npos || bracket_end == std::string::npos) {
-            return osds_in_root;
-        }
-
-        std::string items_str =
-            crush_dump_output.substr(bracket_start + 1, bracket_end - bracket_start - 1);
-        size_t item_pos = 0;
-        while ((item_pos = items_str.find("\"id\"", item_pos)) != std::string::npos) {
-            size_t colon_pos = items_str.find(":", item_pos);
-            size_t num_start = items_str.find_first_of("0123456789-", colon_pos);
-            size_t num_end = items_str.find_first_of(",}]", num_start);
-            std::string id_str = items_str.substr(num_start, num_end - num_start);
-            try {
-                int32_t osd_id = std::stoi(id_str);
-                osds_in_root.push_back(osd_id);
-            } catch (...) {
-                // 忽略无效 ID
-            }
-            item_pos = num_end;
-        }
-        return osds_in_root;
+        return getOsds(outbl.to_str());
     }
 
     int32_t moveOsd(std::string rootName, int32_t* osdIdList, uint32_t listSize)
@@ -2363,26 +2341,28 @@ private:
         return 0;
     }
 
-    // 将查询结果字符串转变为osd列表
-    std::vector<int32_t> getOsds(std::string osd_list_str)
+    // Plain MON output contains one OSD ID per line.
+    std::vector<int32_t> getOsds(std::string_view osd_list)
     {
         std::vector<int32_t> existing_osds;
-        size_t pos = 0;
-        while (pos < osd_list_str.length()) {
-            size_t newline_pos = osd_list_str.find('\n', pos);
-            if (newline_pos == std::string::npos) { newline_pos = osd_list_str.length(); }
-            std::string osd_id_str = osd_list_str.substr(pos, newline_pos - pos);
-            // 跳过空行和空白
-            if (!osd_id_str.empty() &&
-                osd_id_str.find_first_not_of(" \t\r\n") != std::string::npos) {
-                try {
-                    int32_t osd_id = std::stoi(osd_id_str);
-                    existing_osds.push_back(osd_id);
-                } catch (...) {
-                    // 忽略无效的 OSD ID
-                }
+        while (!osd_list.empty()) {
+            const auto newline = osd_list.find('\n');
+            auto line = osd_list.substr(0, newline);
+            osd_list.remove_prefix(newline == std::string_view::npos ? osd_list.size()
+                                                                     : newline + 1);
+
+            const auto start = line.find_first_not_of(" \t\r\v\f");
+            if (start == std::string_view::npos) { continue; }
+            line.remove_prefix(start);
+            // Match stoi's optional '+' and numeric prefix handling.
+            if (line.front() == '+') {
+                line.remove_prefix(1);
+                if (line.empty() || line.front() < '0' || line.front() > '9') { continue; }
             }
-            pos = newline_pos + 1;
+            int32_t osd_id;
+            if (std::from_chars(line.data(), line.data() + line.size(), osd_id).ec == std::errc{}) {
+                existing_osds.push_back(osd_id);
+            }
         }
         return existing_osds;
     }
@@ -2416,128 +2396,6 @@ private:
         return 0;
     }
 
-    static std::vector<std::string> ExtractJsonObjects(const std::string& text)
-    {
-        std::vector<std::string> objects;
-        for (size_t i = 0; i < text.size(); ++i) {
-            if (text[i] != '{') { continue; }
-            int depth = 0;
-            bool in_str = false;
-            bool escaped = false;
-            for (size_t j = i; j < text.size(); ++j) {
-                const char c = text[j];
-                if (in_str) {
-                    if (escaped) {
-                        escaped = false;
-                    } else if (c == '\\') {
-                        escaped = true;
-                    } else if (c == '"') {
-                        in_str = false;
-                    }
-                    continue;
-                }
-                if (c == '"') {
-                    in_str = true;
-                } else if (c == '{') {
-                    ++depth;
-                } else if (c == '}') {
-                    if (depth == 1) {
-                        objects.push_back(text.substr(i, j - i + 1));
-                        break;
-                    }
-                    --depth;
-                }
-            }
-        }
-        return objects;
-    }
-
-    static bool ExtractJsonStringField(const std::string& obj, const std::string& key,
-                                       std::string* out)
-    {
-        if (out == nullptr) { return false; }
-        const std::string pattern = "\"" + key + "\"";
-        const size_t key_pos = obj.find(pattern);
-        if (key_pos == std::string::npos) { return false; }
-        const size_t colon = obj.find(':', key_pos + pattern.size());
-        if (colon == std::string::npos) { return false; }
-        const size_t quote = obj.find('"', colon + 1);
-        if (quote == std::string::npos) { return false; }
-        std::string value;
-        bool escaped = false;
-        for (size_t i = quote + 1; i < obj.size(); ++i) {
-            const char c = obj[i];
-            if (escaped) {
-                value.push_back(c);
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                *out = value;
-                return true;
-            } else {
-                value.push_back(c);
-            }
-        }
-        return false;
-    }
-
-    static bool ExtractJsonArrayField(const std::string& obj, const std::string& key,
-                                      std::string* out)
-    {
-        if (out == nullptr) { return false; }
-        const std::string pattern = "\"" + key + "\"";
-        const size_t key_pos = obj.find(pattern);
-        if (key_pos == std::string::npos) { return false; }
-        const size_t start = obj.find('[', key_pos + pattern.size());
-        if (start == std::string::npos) { return false; }
-        int depth = 0;
-        bool in_str = false;
-        bool escaped = false;
-        for (size_t i = start; i < obj.size(); ++i) {
-            const char c = obj[i];
-            if (in_str) {
-                if (escaped) {
-                    escaped = false;
-                } else if (c == '\\') {
-                    escaped = true;
-                } else if (c == '"') {
-                    in_str = false;
-                }
-                continue;
-            }
-            if (c == '"') {
-                in_str = true;
-            } else if (c == '[') {
-                ++depth;
-            } else if (c == ']') {
-                if (depth == 1) {
-                    *out = obj.substr(start + 1, i - start - 1);
-                    return true;
-                }
-                --depth;
-            }
-        }
-        return false;
-    }
-
-    static bool JsonItemNameEquals(const std::string& obj, const std::string& name)
-    {
-        const std::string pattern = "\"item_name\"";
-        size_t pos = 0;
-        while ((pos = obj.find(pattern, pos)) != std::string::npos) {
-            const size_t colon = obj.find(':', pos + pattern.size());
-            if (colon == std::string::npos) { return false; }
-            const size_t quote = obj.find('"', colon + 1);
-            if (quote == std::string::npos) { return false; }
-            const size_t end = obj.find('"', quote + 1);
-            if (end == std::string::npos) { return false; }
-            if (obj.substr(quote + 1, end - quote - 1) == name) { return true; }
-            pos = end + 1;
-        }
-        return false;
-    }
-
     int32_t ClearRedundantCrushRoot()
     {
         ceph::bufferlist outbl;
@@ -2550,27 +2408,29 @@ private:
             AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Failed to query crush dump: " + outs);
             return ret;
         }
-        std::string crush_dump = outbl.to_str();
+        JSONParser crush_dump;
+        auto* buckets = crush_dump.parse(outbl.c_str(), outbl.length())
+                            ? crush_dump.find_obj("buckets")
+                            : nullptr;
+        if (!buckets || !buckets->is_array()) {
+            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Invalid CRUSH bucket dump");
+            return -EIO;
+        }
 
         std::vector<std::string> empty_roots;
-        const std::vector<std::string> buckets = ExtractJsonObjects(crush_dump);
-        for (size_t i = 0; i < buckets.size(); ++i) {
-            const std::string& bucket = buckets[i];
-            if (bucket.find("\"buckets\"") != std::string::npos) { continue; }
-            std::string type_name;
-            if (!ExtractJsonStringField(bucket, "type_name", &type_name) || type_name != "root") {
+        for (auto it = buckets->find_first(); !it.end(); ++it) {
+            auto* bucket = *it;
+            auto* type = bucket->find_obj("type_name");
+            auto* name = bucket->find_obj("name");
+            auto* items = bucket->find_obj("items");
+            if (!type || type->get_data() != "root" || !name || !name->get_data_val().quoted ||
+                name->get_data().empty() || name->get_data() == "default" || !items ||
+                !items->is_array() || !items->find_first().end()) {
                 continue;
             }
-            std::string root_name;
-            if (!ExtractJsonStringField(bucket, "name", &root_name) || root_name == "default") {
-                continue;
-            }
-            std::string items_str;
-            if (!ExtractJsonArrayField(bucket, "items", &items_str)) { continue; }
-            if (items_str.find_first_not_of(" \t\r\n") != std::string::npos) { continue; }
-            empty_roots.push_back(root_name);
+            empty_roots.push_back(name->get_data());
             AGENT_LOG(logger, ::agent::LogLevel::INFO,
-                      "Crush root " + root_name + " is empty, will be cleaned up");
+                      "Crush root " + name->get_data() + " is empty, will be cleaned up");
         }
 
         if (empty_roots.empty()) {
@@ -2586,7 +2446,16 @@ private:
             AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Failed to query crush rule dump: " + outs);
             return ret;
         }
-        std::string rule_dump = outbl.to_str();
+        JSONParser rule_dump;
+        if (!rule_dump.parse(outbl.c_str(), outbl.length())) {
+            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Invalid CRUSH rule dump");
+            return -EIO;
+        }
+        auto* rules = rule_dump.is_array() ? &rule_dump : rule_dump.find_obj("rules");
+        if (!rules || !rules->is_array()) {
+            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Missing CRUSH rules in rule dump");
+            return -EIO;
+        }
 
         outbl.clear();
         outs.clear();
@@ -2617,13 +2486,21 @@ private:
                       "Cleaning up redundant crush root: " + root_name);
 
             std::vector<std::string> bound_rules;
-            const std::vector<std::string> rules = ExtractJsonObjects(rule_dump);
-            for (size_t r = 0; r < rules.size(); ++r) {
-                if (rules[r].find("\"rules\"") != std::string::npos) { continue; }
-                std::string rule_name;
-                if (!ExtractJsonStringField(rules[r], "rule_name", &rule_name)) { continue; }
-                if (!JsonItemNameEquals(rules[r], root_name)) { continue; }
-                bound_rules.push_back(rule_name);
+            for (auto it = rules->find_first(); !it.end(); ++it) {
+                auto* rule = *it;
+                auto* rule_name = rule->find_obj("rule_name");
+                auto* steps = rule->find_obj("steps");
+                if (!rule_name || !rule_name->get_data_val().quoted || !steps ||
+                    !steps->is_array()) {
+                    continue;
+                }
+                for (auto step = steps->find_first(); !step.end(); ++step) {
+                    auto* item_name = (*step)->find_obj("item_name");
+                    if (item_name && item_name->get_data() == root_name) {
+                        bound_rules.push_back(rule_name->get_data());
+                        break;
+                    }
+                }
             }
 
             bool pool_delete_failed = false;

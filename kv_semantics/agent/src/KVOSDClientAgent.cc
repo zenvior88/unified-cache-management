@@ -387,9 +387,9 @@ private:
                 const int ret = osdmap.crush->get_all_children(root, &member_osds);
                 if (ret < 0) {
                     AGENT_LOG(logger, LogLevel::ERROR,
-                              "ns view: skipping pool " + pool_name + " for ns " + ns +
-                                  ", rule=" + std::to_string(rule_id) +
-                                  ", root=" + std::to_string(root) + ", ret=" + std::to_string(ret));
+                              "ns view: skipping pool " + pool_name + " for ns " + ns + ", rule=" +
+                                  std::to_string(rule_id) + ", root=" + std::to_string(root) +
+                                  ", ret=" + std::to_string(ret));
                     valid = false;
                     break;
                 }
