@@ -1201,30 +1201,12 @@ public:
         if (ceph_pool_exists) {
             AGENT_LOG(logger, ::agent::LogLevel::INFO,
                       "ceph pool already exists, continuing: " + outs);
-            outbl.clear();
-            outs.clear();
-            // ceph osd pool get <pool> crush rule -> "crush_rule: <rule-name>"
-            int32_t getRuleRet =
-                mon_command_sync({std::string("{\"prefix\": \"osd pool get\", \"pool\": \"") +
-                                  kvnsNameString + "\", \"var\": \"crush_rule\"}"},
-                                 &outbl, &outs);
+            std::string boundRule;
+            int32_t getRuleRet = query_pool_crush_rule(kvnsNameString, &boundRule, &outs);
             if (getRuleRet < 0) {
                 AGENT_LOG(logger, ::agent::LogLevel::ERROR,
-                          "Failed to query crush rule of pool " + kvnsNameString + ": " + outs);
+                          "Failed to get crush rule of pool " + kvnsNameString + ": " + outs);
                 return getRuleRet;
-            }
-            // 解析返回的 rule 名: 取最后一个 ':' 之后的字段并去除空白
-            std::string ruleOut = outbl.to_str();
-            std::string boundRule;
-            size_t colonPos = ruleOut.rfind(':');
-            if (colonPos != std::string::npos) { boundRule = ruleOut.substr(colonPos + 1); }
-            size_t leadPos = boundRule.find_first_not_of(" \t\r\n");
-            if (leadPos == std::string::npos) {
-                boundRule.clear();
-            } else {
-                boundRule = boundRule.substr(leadPos);
-                size_t tailPos = boundRule.find_last_not_of(" \t\r\n");
-                if (tailPos != std::string::npos) { boundRule = boundRule.substr(0, tailPos + 1); }
             }
             if (boundRule != ruleName) {
                 AGENT_LOG(logger, ::agent::LogLevel::ERROR,
@@ -1258,29 +1240,21 @@ public:
             return -EINVAL;
         }
 
-        ceph::bufferlist outbl;
         std::string outs;
-        int32_t ret = mon_command_sync({R"({"prefix":"osd pool get","pool":")" + poolName +
-                                        R"(","var":"crush_rule","format":"json"})"},
-                                       &outbl, &outs);
+        std::string boundRule;
+        int32_t ret = query_pool_crush_rule(poolName, &boundRule, &outs);
         if (ret == -ENOENT) { return 0; }
         if (ret < 0) {
-            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Failed to query Ceph pool: " + outs);
+            AGENT_LOG(logger, ::agent::LogLevel::ERROR,
+                      "Failed to get crush rule of pool " + poolName + ": " + outs);
             return ret;
         }
 
-        JSONParser response;
-        auto* rule = response.parse(outbl.c_str(), outbl.length()) ? response.find_obj("crush_rule")
-                                                                   : nullptr;
-        if (!rule || !rule->get_data_val().quoted) {
-            AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Invalid CRUSH rule reply for " + poolName);
-            return -EIO;
-        }
-        if (rule->get_data() != make_crush_rule_name(kvPoolName)) {
+        if (boundRule != make_crush_rule_name(kvPoolName)) {
             AGENT_LOG(logger, ::agent::LogLevel::ERROR, "Unexpected CRUSH rule for " + poolName);
             return -EEXIST;
         }
-        outbl.clear();
+        ceph::bufferlist outbl;
         outs.clear();
         ret = mon_command_sync(
             {std::string("{\"prefix\": \"osd pool delete\", \"pool\": \"") + poolName +
@@ -2396,6 +2370,28 @@ private:
         return 0;
     }
 
+    // Return 0 with the rule name, a MON error, or -EIO for an invalid reply.
+    int32_t query_pool_crush_rule(const std::string& poolName, std::string* boundRule,
+                                  std::string* outs)
+    {
+        ceph::bufferlist outbl;
+        outs->clear();
+        int32_t ret = mon_command_sync({R"({"prefix":"osd pool get","pool":")" + poolName +
+                                        R"(","var":"crush_rule","format":"json"})"},
+                                       &outbl, outs);
+        if (ret < 0) { return ret; }
+
+        JSONParser response;
+        auto* rule = response.parse(outbl.c_str(), outbl.length()) ? response.find_obj("crush_rule")
+                                                                   : nullptr;
+        if (!rule || !rule->get_data_val().quoted) {
+            *outs = "invalid crush rule reply from monitor";
+            return -EIO;
+        }
+        *boundRule = rule->get_data();
+        return 0;
+    }
+
     int32_t ClearRedundantCrushRoot()
     {
         ceph::bufferlist outbl;
@@ -2508,32 +2504,12 @@ private:
                 const std::string& bound_rule = bound_rules[r];
                 for (size_t p = 0; p < pool_names.size(); ++p) {
                     const std::string& pool_name = pool_names[p];
-                    outbl.clear();
-                    outs.clear();
-                    int32_t get_ret = mon_command_sync(
-                        {std::string("{\"prefix\": \"osd pool get\", \"pool\": \"") + pool_name +
-                         "\", \"var\": \"crush_rule\"}"},
-                        &outbl, &outs);
+                    std::string pool_rule;
+                    int32_t get_ret = query_pool_crush_rule(pool_name, &pool_rule, &outs);
                     if (get_ret < 0) {
                         AGENT_LOG(logger, ::agent::LogLevel::WARNING,
-                                  "Failed to query crush rule of pool " + pool_name + ": " + outs);
+                                  "Failed to get crush rule of pool " + pool_name + ": " + outs);
                         continue;
-                    }
-                    std::string rule_out = outbl.to_str();
-                    size_t colon_pos = rule_out.rfind(':');
-                    std::string pool_rule;
-                    if (colon_pos != std::string::npos) {
-                        pool_rule = rule_out.substr(colon_pos + 1);
-                    }
-                    size_t lead_pos2 = pool_rule.find_first_not_of(" \t\r\n");
-                    if (lead_pos2 == std::string::npos) {
-                        pool_rule.clear();
-                    } else {
-                        pool_rule = pool_rule.substr(lead_pos2);
-                        size_t tail_pos2 = pool_rule.find_last_not_of(" \t\r\n");
-                        if (tail_pos2 != std::string::npos) {
-                            pool_rule = pool_rule.substr(0, tail_pos2 + 1);
-                        }
                     }
                     if (pool_rule != bound_rule) { continue; }
                     // 删除绑定的 ceph pool
