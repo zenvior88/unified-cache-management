@@ -113,6 +113,11 @@ if(KV_AGENT_BUILD_SHARED)
   set_target_properties(kv-client-agent-smoke PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+  add_executable(kv-view-smoke tools/kv-view-smoke.cc)
+  target_link_libraries(kv-view-smoke PRIVATE kv_agent)
+  set_target_properties(kv-view-smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
   add_executable(kv-osd-agent-smoke
     tools/kv-osd-agent-smoke.c)
   add_dependencies(kv-osd-agent-smoke kv_agent)
